@@ -168,6 +168,177 @@ final class Insertion {
         var writable: DarwinBoolean = false
         let canAX = range != nil && AXUIElementIsAttributeSettable(current.element, kAXSelectedTextAttribute as CFString,
                                                  &writable) == .success && writable.boolValue
+        func pasteViaClipboard() {
+            let board = NSPasteboard.general
+            var saved: [[NSPasteboard.PasteboardType: Data]] = []
+            var bytes = 0
+            var preserving = preserve
+            if preserve {
+                // Snapshot every materializable type; promises or oversized content are not restored, but
+                // they no longer block insertion either.
+                snapshot: for item in board.pasteboardItems ?? [] {
+                    var values: [NSPasteboard.PasteboardType: Data] = [:]
+                    for type in item.types {
+                        guard let data = item.data(forType: type) else { preserving = false; break snapshot }
+                        bytes += data.count
+                        guard bytes <= 8_388_608 else { preserving = false; break snapshot }
+                        values[type] = data
+                    }
+                    saved.append(values)
+                }
+                if !preserving { saved = [] }
+            }
+            let keptNote = preserve && !preserving ? " Your previous clipboard could not be kept." : ""
+            func stillTargeted(_ latest: TargetSnapshot?) -> Bool {
+                guard let latest else { return false }
+                return range == nil ? current.sameFocus(latest) : current.matches(latest)
+            }
+            guard stillTargeted(TargetSnapshot.capture()) else {
+                completion("Focus changed before paste. Use Copy last.", false); return
+            }
+            let transaction = UUID().uuidString
+            let payload = ClipboardProvider(text)
+            let item = NSPasteboardItem()
+            item.setDataProvider(payload, forTypes: [.string])
+            item.setString(transaction, forType: Self.marker)
+            board.clearContents()
+            let clearedCount = board.changeCount
+            guard board.writeObjects([item]) else {
+                if preserving && board.changeCount == clearedCount && (board.pasteboardItems ?? []).isEmpty {
+                    let previous = saved.map { values -> NSPasteboardItem in
+                        let savedItem = NSPasteboardItem()
+                        for (type, data) in values { savedItem.setData(data, forType: type) }
+                        return savedItem
+                    }
+                    if !previous.isEmpty { board.writeObjects(previous) }
+                }
+                completion("Clipboard write failed. Use Copy last.", false); return
+            }
+            let count = board.changeCount
+            provider = payload
+            var pastePosted = false
+            var readAt: TimeInterval?
+            var readBeforePaste = false
+            var postedAt = 0.0
+            payload.onRead = {
+                guard readAt == nil else { return }
+                readAt = ProcessInfo.processInfo.systemUptime
+                // A clipboard manager reads eagerly; the provider then never sees the target's read.
+                if !pastePosted { readBeforePaste = true }
+            }
+            let began = ProcessInfo.processInfo.systemUptime
+            var timer: Timer?
+            var finished = false
+            func finish(_ message: String, restore: Bool, delivered: Bool = false) {
+                guard !finished else { return }
+                finished = true; timer?.invalidate(); timer = nil
+                if restore && preserving && PastePolicy.canRestore(ownedCount: count, currentCount: board.changeCount,
+                                          ownedID: transaction, currentID: board.string(forType: Self.marker)) {
+                    let items = saved.map { values -> NSPasteboardItem in
+                        let item = NSPasteboardItem()
+                        for (type, data) in values { item.setData(data, forType: type) }
+                        return item
+                    }
+                    board.clearContents()
+                    if !items.isEmpty { board.writeObjects(items) }
+                } else if PastePolicy.canRestore(ownedCount: count, currentCount: board.changeCount,
+                                                ownedID: transaction, currentID: board.string(forType: Self.marker)) {
+                    // Materialize before releasing the provider; keep the transcript for manual recovery.
+                    item.setString(text, forType: .string)
+                }
+                self.provider = nil; self.pendingCancel = nil
+                completion(message + keptNote, delivered)
+            }
+            pendingCancel = {
+                finish(pastePosted ? "Paste cancelled. Check the field before retrying." :
+                       "Paste cancelled before dispatch.", restore: !pastePosted)
+            }
+            guard let pasteKey = pasteKeyCode() else {
+                finish("Cannot resolve this keyboard layout safely. Use Copy last.", restore: true); return
+            }
+            let source = CGEventSource(stateID: .combinedSessionState)
+            let down = CGEvent(keyboardEventSource: source, virtualKey: pasteKey, keyDown: true)
+            let up = CGEvent(keyboardEventSource: source, virtualKey: pasteKey, keyDown: false)
+            guard let down, let up else { finish("Cannot create paste event. Use Copy last.", restore: true); return }
+            // Wait for real shortcut modifiers to be released instead of injecting into a held chord.
+            func postWhenReleased(_ attempts: Int) {
+                guard !finished else { return }
+                // Physical state, without fn: fn is often the dictation key, its session flag can lag after
+                // release, and the paste event below carries its own explicit modifier flags anyway.
+                let flags = CGEventSource.flagsState(.hidSystemState).rawValue & Hotkey.mask & ~UInt64(1 << 23)
+                guard flags == 0 else {
+                    if attempts > 60 { finish("Release modifier keys, then use Copy last.", restore: true); return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { postWhenReleased(attempts + 1) }
+                    return
+                }
+                guard stillTargeted(TargetSnapshot.capture()) else {
+                    finish("Focus changed before paste. Use Copy last.", restore: true); return
+                }
+                if remote {
+                    bounceRemoteViewer(); return
+                }
+                postPaste()
+            }
+            func postPaste() {
+                pastePosted = true; postedAt = ProcessInfo.processInfo.systemUptime
+                for event in [down, up] {
+                    event.flags = .maskCommand
+                    event.setIntegerValueField(.eventSourceUserData, value: 0x4C464C57)
+                    event.post(tap: .cghidEventTap)
+                }
+                timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+                    guard !finished else { return }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    if remote {
+                        // The remote machine pastes later; keep the transcript on the clipboard for it.
+                        if now - postedAt >= 1 { finish("Sent to the remote session. The transcript stays on the clipboard.", restore: false, delivered: true) }
+                        return
+                    }
+                    if range == nil {
+                        if let readAt, !readBeforePaste, now - readAt >= 0.75 {
+                            finish("Pasted. This app doesn't report its text, so give it a quick check.", restore: true, delivered: true)
+                        } else if readBeforePaste && now - postedAt >= 1 {
+                            finish("Pasted. This app doesn't report its text, so give it a quick check.", restore: true, delivered: true)
+                        } else if readAt == nil && now - postedAt >= 1.5 {
+                            finish("Nothing accepted the paste. The transcript is on the clipboard; click a text box and paste.", restore: false)
+                        }
+                        return
+                    }
+                    let sameTarget = TargetSnapshot.capture().map { $0.pid == current.pid && CFEqual($0.element, current.element) } ?? false
+                    let value = sameTarget ? TargetSnapshot.attribute(current.element, kAXValueAttribute) as? String : nil
+                    if let expected, value == expected {
+                        recordVerified()
+                        finish("Text pasted and verified.", restore: true, delivered: true)
+                    } else if let readAt, now - readAt >= 0.75 {
+                        // The target read the clipboard after the paste; its text just isn't readable back.
+                        finish("Pasted. The app didn't report the edit, so give it a quick check.", restore: true, delivered: true)
+                    } else if now - began >= 5 {
+                        finish("Paste unconfirmed. Transcript is available for manual recovery.", restore: false)
+                    }
+                }
+            }
+            /// Remote viewers sync the clipboard when they regain focus, so hand focus away and back first.
+            func bounceRemoteViewer() {
+                guard let viewer = NSRunningApplication(processIdentifier: current.pid),
+                      let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first else {
+                    postPaste(); return
+                }
+                finder.activate()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    guard !finished else { return }
+                    viewer.activate()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        guard !finished else { return }
+                        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == current.pid else {
+                            finish("The remote viewer did not come back to the front. The transcript is on the clipboard.", restore: false)
+                            return
+                        }
+                        postPaste()
+                    }
+                }
+            }
+            postWhenReleased(0)
+        }
         if canAX {
             let result = AXUIElementSetAttributeValue(current.element, kAXSelectedTextAttribute as CFString,
                                                       text as CFString)
@@ -175,6 +346,11 @@ final class Insertion {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     guard self.generation == currentGeneration else { return }
                     let value = TargetSnapshot.attribute(current.element, kAXValueAttribute) as? String
+                    // Chromium and Electron fields can accept the call and change nothing. An exactly
+                    // unchanged field proves no edit happened, so pasting cannot duplicate text.
+                    if expected != nil, let value, value == current.value, value != expected {
+                        pasteViaClipboard(); return
+                    }
                     if expected != nil && value == expected { recordVerified() }
                     completion(expected != nil && value == expected ? "Text inserted and verified." :
                                "Insertion accepted by app. Transcript remains available here.", true)
@@ -185,172 +361,6 @@ final class Insertion {
                 completion("Insertion outcome uncertain. Check the field before pasting again.", false); return
             }
         }
-        let board = NSPasteboard.general
-        var saved: [[NSPasteboard.PasteboardType: Data]] = []
-        var bytes = 0
-        var preserving = preserve
-        if preserve {
-            // Snapshot every materializable type; promises or oversized content are not restored, but
-            // they no longer block insertion either.
-            snapshot: for item in board.pasteboardItems ?? [] {
-                var values: [NSPasteboard.PasteboardType: Data] = [:]
-                for type in item.types {
-                    guard let data = item.data(forType: type) else { preserving = false; break snapshot }
-                    bytes += data.count
-                    guard bytes <= 8_388_608 else { preserving = false; break snapshot }
-                    values[type] = data
-                }
-                saved.append(values)
-            }
-            if !preserving { saved = [] }
-        }
-        let keptNote = preserve && !preserving ? " Your previous clipboard could not be kept." : ""
-        func stillTargeted(_ latest: TargetSnapshot?) -> Bool {
-            guard let latest else { return false }
-            return range == nil ? current.sameFocus(latest) : current.matches(latest)
-        }
-        guard stillTargeted(TargetSnapshot.capture()) else {
-            completion("Focus changed before paste. Use Copy last.", false); return
-        }
-        let transaction = UUID().uuidString
-        let payload = ClipboardProvider(text)
-        let item = NSPasteboardItem()
-        item.setDataProvider(payload, forTypes: [.string])
-        item.setString(transaction, forType: Self.marker)
-        board.clearContents()
-        let clearedCount = board.changeCount
-        guard board.writeObjects([item]) else {
-            if preserving && board.changeCount == clearedCount && (board.pasteboardItems ?? []).isEmpty {
-                let previous = saved.map { values -> NSPasteboardItem in
-                    let savedItem = NSPasteboardItem()
-                    for (type, data) in values { savedItem.setData(data, forType: type) }
-                    return savedItem
-                }
-                if !previous.isEmpty { board.writeObjects(previous) }
-            }
-            completion("Clipboard write failed. Use Copy last.", false); return
-        }
-        let count = board.changeCount
-        provider = payload
-        var pastePosted = false
-        var readAt: TimeInterval?
-        var readBeforePaste = false
-        var postedAt = 0.0
-        payload.onRead = {
-            guard readAt == nil else { return }
-            readAt = ProcessInfo.processInfo.systemUptime
-            // A clipboard manager reads eagerly; the provider then never sees the target's read.
-            if !pastePosted { readBeforePaste = true }
-        }
-        let began = ProcessInfo.processInfo.systemUptime
-        var timer: Timer?
-        var finished = false
-        func finish(_ message: String, restore: Bool, delivered: Bool = false) {
-            guard !finished else { return }
-            finished = true; timer?.invalidate(); timer = nil
-            if restore && preserving && PastePolicy.canRestore(ownedCount: count, currentCount: board.changeCount,
-                                      ownedID: transaction, currentID: board.string(forType: Self.marker)) {
-                let items = saved.map { values -> NSPasteboardItem in
-                    let item = NSPasteboardItem()
-                    for (type, data) in values { item.setData(data, forType: type) }
-                    return item
-                }
-                board.clearContents()
-                if !items.isEmpty { board.writeObjects(items) }
-            } else if PastePolicy.canRestore(ownedCount: count, currentCount: board.changeCount,
-                                            ownedID: transaction, currentID: board.string(forType: Self.marker)) {
-                // Materialize before releasing the provider; keep the transcript for manual recovery.
-                item.setString(text, forType: .string)
-            }
-            self.provider = nil; self.pendingCancel = nil
-            completion(message + keptNote, delivered)
-        }
-        pendingCancel = {
-            finish(pastePosted ? "Paste cancelled. Check the field before retrying." :
-                   "Paste cancelled before dispatch.", restore: !pastePosted)
-        }
-        guard let pasteKey = pasteKeyCode() else {
-            finish("Cannot resolve this keyboard layout safely. Use Copy last.", restore: true); return
-        }
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let down = CGEvent(keyboardEventSource: source, virtualKey: pasteKey, keyDown: true)
-        let up = CGEvent(keyboardEventSource: source, virtualKey: pasteKey, keyDown: false)
-        guard let down, let up else { finish("Cannot create paste event. Use Copy last.", restore: true); return }
-        // Wait for real shortcut modifiers to be released instead of injecting into a held chord.
-        func postWhenReleased(_ attempts: Int) {
-            guard !finished else { return }
-            let flags = CGEventSource.flagsState(.combinedSessionState).rawValue & Hotkey.mask
-            guard flags == 0 else {
-                if attempts > 30 { finish("Release modifier keys, then use Copy last.", restore: true); return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { postWhenReleased(attempts + 1) }
-                return
-            }
-            guard stillTargeted(TargetSnapshot.capture()) else {
-                finish("Focus changed before paste. Use Copy last.", restore: true); return
-            }
-            if remote {
-                bounceRemoteViewer(); return
-            }
-            postPaste()
-        }
-        func postPaste() {
-            pastePosted = true; postedAt = ProcessInfo.processInfo.systemUptime
-            for event in [down, up] {
-                event.flags = .maskCommand
-                event.setIntegerValueField(.eventSourceUserData, value: 0x4C464C57)
-                event.post(tap: .cghidEventTap)
-            }
-            timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-                guard !finished else { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                if remote {
-                    // The remote machine pastes later; keep the transcript on the clipboard for it.
-                    if now - postedAt >= 1 { finish("Sent to the remote session. The transcript stays on the clipboard.", restore: false, delivered: true) }
-                    return
-                }
-                if range == nil {
-                    if let readAt, !readBeforePaste, now - readAt >= 0.75 {
-                        finish("Pasted. This app doesn't report its text, so give it a quick check.", restore: true, delivered: true)
-                    } else if readBeforePaste && now - postedAt >= 1 {
-                        finish("Pasted. This app doesn't report its text, so give it a quick check.", restore: true, delivered: true)
-                    } else if readAt == nil && now - postedAt >= 1.5 {
-                        finish("Nothing accepted the paste. The transcript is on the clipboard; click a text box and paste.", restore: false)
-                    }
-                    return
-                }
-                let sameTarget = TargetSnapshot.capture().map { $0.pid == current.pid && CFEqual($0.element, current.element) } ?? false
-                let value = sameTarget ? TargetSnapshot.attribute(current.element, kAXValueAttribute) as? String : nil
-                if let expected, value == expected {
-                    recordVerified()
-                    finish("Text pasted and verified.", restore: true, delivered: true)
-                } else if let readAt, now - readAt >= 0.75 {
-                    // The target read the clipboard after the paste; its text just isn't readable back.
-                    finish("Pasted. The app didn't report the edit, so give it a quick check.", restore: true, delivered: true)
-                } else if now - began >= 5 {
-                    finish("Paste unconfirmed. Transcript is available for manual recovery.", restore: false)
-                }
-            }
-        }
-        /// Remote viewers sync the clipboard when they regain focus, so hand focus away and back first.
-        func bounceRemoteViewer() {
-            guard let viewer = NSRunningApplication(processIdentifier: current.pid),
-                  let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first else {
-                postPaste(); return
-            }
-            finder.activate()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                guard !finished else { return }
-                viewer.activate()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    guard !finished else { return }
-                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == current.pid else {
-                        finish("The remote viewer did not come back to the front. The transcript is on the clipboard.", restore: false)
-                        return
-                    }
-                    postPaste()
-                }
-            }
-        }
-        postWhenReleased(0)
+        pasteViaClipboard()
     }
 }
