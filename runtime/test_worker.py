@@ -133,5 +133,41 @@ class WorkerTests(unittest.TestCase):
             self.fail("Orphaned worker kept running")
 
 
+    def _source(self, folder, name, content):
+        import hashlib
+        path = Path(folder) / name
+        path.write_bytes(content)
+        return path, (len(content), hashlib.sha256(content).hexdigest())
+
+    def test_fetch_installs_only_verified_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, (size, digest) = self._source(folder, "weights.bin", b"orator" * 1000)
+            target = Path(folder) / "out.bin"
+            worker.fetch(source.as_uri(), target, size, digest)
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            corrupt = Path(folder) / "bad.bin"
+            with self.assertRaises(ValueError):
+                worker.fetch(source.as_uri(), corrupt, size, "0" * 64)
+            self.assertFalse(corrupt.exists())
+            self.assertFalse(corrupt.with_name("bad.bin.partial").exists())
+
+    def test_download_skips_files_that_already_verify(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            _, config = self._source(src, "config.json", b"{}")
+            _, weights = self._source(src, "model.safetensors", b"w" * 4096)
+            original = worker.MODEL_FILES
+            worker.MODEL_FILES = {"config.json": config, "model.safetensors": weights}
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    worker.download(dst, source=Path(src).as_uri() + "/")
+                    (Path(src) / "model.safetensors").unlink()  # a second run must not need the network
+                    worker.download(dst, source=Path(src).as_uri() + "/")
+            finally:
+                worker.MODEL_FILES = original
+            self.assertEqual((Path(dst) / "model.safetensors").read_bytes(), b"w" * 4096)
+            self.assertTrue((Path(dst) / "provenance.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

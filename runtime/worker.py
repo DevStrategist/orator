@@ -92,10 +92,14 @@ def transcribe(model, audio, request_id):
     return sentences_to_result(tokens_to_sentences(tokens)).text.strip()
 
 
-MODEL_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
-# Pinned so every install gets the exact weights this release was tested with.
-MODEL_REVISION = "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15"
-MODEL_FILES = ("config.json", "model.safetensors")
+# Parakeet TDT 0.6B v3 with an 8-bit encoder, quantized from mlx-community/parakeet-tdt-0.6b-v3 at
+# revision ed2b7e8 by scripts/quantize_model.py. Transcripts match the full-precision model on the
+# benchmark set while the download is 3.3x smaller. Pinned by size and SHA-256.
+MODEL_SOURCE = "https://github.com/DevStrategist/orator/releases/download/speech-model-v1/"
+MODEL_FILES = {
+    "config.json": (235588, "06e1260568d5f4fb6f921fd24d6222cfa033af214b5e504f47b0e0db3599ec38"),
+    "model.safetensors": (754851107, "e3745e51e513494c60494ce2ff61d49961823b3ce0333ff983bc6f83ddbbca45"),
+}
 
 
 def sha256(path):
@@ -108,24 +112,56 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def download(destination, revision=MODEL_REVISION):
-    """One-time setup download. Reports JSON lines so the app can show progress."""
-    from huggingface_hub import HfApi, snapshot_download
+def fetch(url, target, size, digest):
+    """Streams one file to a .partial sibling and moves it into place only once it verifies."""
+    import urllib.request
 
+    partial = target.with_name(target.name + ".partial")
+    request = urllib.request.Request(url, headers={"User-Agent": "Orator"})
+    with urllib.request.urlopen(request, timeout=60) as response, open(partial, "wb") as out:
+        for block in iter(lambda: response.read(1 << 20), b""):
+            out.write(block)
+    if partial.stat().st_size != size or sha256(partial) != digest:
+        partial.unlink(missing_ok=True)
+        raise ValueError(f"Checksum mismatch for {target.name}")
+    os.replace(partial, target)
+
+
+def download(destination, source=MODEL_SOURCE):
+    """One-time setup download. Reports JSON lines so the app can show progress."""
     destination = Path(destination).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    info = HfApi(token=False).model_info(MODEL_REPO, revision=revision, files_metadata=True)
-    files = [sibling for sibling in info.siblings if sibling.rfilename in MODEL_FILES]
-    emit({"event": "size", "bytes": sum(sibling.size or 0 for sibling in files)})
-    snapshot_download(MODEL_REPO, revision=revision, local_dir=destination, token=False,
-                      allow_patterns=list(MODEL_FILES))
-    for sibling in files:
-        expected = sibling.lfs.sha256 if sibling.lfs else None
-        if expected and sha256(destination / sibling.rfilename) != expected:
-            (destination / sibling.rfilename).unlink(missing_ok=True)
-            raise ValueError(f"Checksum mismatch for {sibling.rfilename}")
-    (destination / "provenance.json").write_text(json.dumps({"repository": MODEL_REPO, "revision": revision}, indent=2))
-    emit({"event": "downloaded", "revision": revision})
+    emit({"event": "size", "bytes": sum(size for size, _ in MODEL_FILES.values())})
+    for name, (size, digest) in MODEL_FILES.items():
+        target = destination / name
+        if target.is_file() and target.stat().st_size == size and sha256(target) == digest:
+            continue
+        fetch(source + name, target, size, digest)
+    (destination / "provenance.json").write_text(json.dumps({"source": source, "files": MODEL_FILES}, indent=2))
+    emit({"event": "downloaded"})
+
+
+def load_model(model_path):
+    """Loads full-precision or quantized weights; quantized layers are rebuilt before loading."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_unflatten
+    from parakeet_mlx import from_pretrained
+    from parakeet_mlx.utils import from_config
+
+    config = json.loads((model_path / "config.json").read_text())
+    quantization = config.get("quantization")
+    if not quantization:
+        return from_pretrained(str(model_path))
+    model = from_config(config)
+    target = model.encoder if quantization.get("strategy") == "encoder_only" else model
+    nn.quantize(target, group_size=quantization["group_size"], bits=quantization["bits"])
+    model.load_weights(str(model_path / "model.safetensors"))
+    # Cast floating parameters only: quantized weights are packed integers.
+    parameters = [(key, value.astype(mx.bfloat16) if mx.issubdtype(value.dtype, mx.floating) else value)
+                  for key, value in tree_flatten(model.parameters())]
+    model.update(tree_unflatten(parameters))
+    return model
 
 
 def watch_parent(interval=2.0):
@@ -153,14 +189,13 @@ def serve(model_path, root):
     # All third-party stdout is diagnostic, never part of the wire protocol.
     sys.stdout = sys.stderr
     import mlx.core as mx
-    from parakeet_mlx import from_pretrained
     from parakeet_mlx.audio import get_logmel
 
     try:
         model_path = Path(model_path).expanduser().resolve(strict=True)
         if not (model_path / "model.safetensors").is_file():
             raise ValueError("Local model weights are missing")
-        model = from_pretrained(str(model_path))
+        model = load_model(model_path)
         mx.eval(model.parameters())
         model.generate(get_logmel(mx.zeros(16000, dtype=mx.float32), model.preprocessor_config))
         mx.clear_cache()

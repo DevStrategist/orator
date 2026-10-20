@@ -170,7 +170,10 @@ public enum OratorPaths {
     }
     public static var recordings: URL { support.appendingPathComponent("Recordings", isDirectory: true) }
     public static var settings: URL { support.appendingPathComponent("settings.json") }
-    public static var model: URL { support.appendingPathComponent("model", isDirectory: true) }
+    /// Parakeet TDT 0.6B v3 with an 8-bit encoder (755 MB).
+    public static var model: URL { support.appendingPathComponent("models/parakeet-tdt-0.6b-v3-int8", isDirectory: true) }
+    /// The full-precision 2.5 GB model used by earlier builds; removed once the new model is running.
+    public static var legacyModel: URL { support.appendingPathComponent("model", isDirectory: true) }
     public static func prepare() throws {
         migrateLegacySupport()
         for path in [support, recordings] {

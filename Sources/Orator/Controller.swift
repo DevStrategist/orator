@@ -204,12 +204,12 @@ final class Controller: NSObject, ObservableObject {
             switch setupStage {
             case .installingEngine:
                 items.append(SetupItem(title: "Installing the speech engine",
-                                       detail: "One time only, about 600 MB. Everything stays in Orator's own folder.",
+                                       detail: "One time only, about 550 MB. Everything stays in Orator's own folder.",
                                        action: nil, run: retry))
             case .downloadingModel(let fraction):
                 items.append(SetupItem(title: "Downloading the speech model",
-                                       detail: fraction.map { "\(Int($0 * 100))% of 2.5 GB. After this, Orator works offline." } ??
-                                           "Starting the 2.5 GB download. After this, Orator works offline.",
+                                       detail: fraction.map { "\(Int($0 * 100))% of 755 MB. After this, Orator works offline." } ??
+                                           "Starting the 755 MB download. After this, Orator works offline.",
                                        action: nil, progress: fraction, run: retry))
             case .verifying:
                 items.append(SetupItem(title: "Checking the speech model", detail: "Verifying the download.", action: nil, run: retry))
@@ -656,6 +656,10 @@ final class Controller: NSObject, ObservableObject {
         if event == "ready" {
             modelReady = true
             if phase == .idle { message = "Ready. Recognition stays on this Mac." }
+            // The smaller model is running, so the old full-precision copy is no longer needed.
+            if settings.modelPath.isEmpty, FileManager.default.fileExists(atPath: OratorPaths.legacyModel.path) {
+                try? FileManager.default.removeItem(at: OratorPaths.legacyModel)
+            }
             return
         }
         if event == "fatal" {

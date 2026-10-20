@@ -652,7 +652,7 @@ private struct PrivacyPage: View {
         VStack(alignment: .leading, spacing: 24) {
             PageHeader(title: "Privacy", subtitle: "Speech recognition runs on this Mac. There is no account, server or cloud processing.")
             SettingsGroup(title: "Speech model", footer: "The model is downloaded once during setup. After that, Orator never connects to the internet.") {
-                Row(title: "Parakeet TDT 0.6B v3", detail: app.modelReady ? "Loaded and ready" : "Loading…") {
+                Row(title: "Parakeet TDT 0.6B v3, 8-bit", detail: app.modelReady ? "Loaded and ready" : "Loading…") {
                     StatusDot(ok: app.modelReady)
                 }
                 Row(title: "Model folder", detail: "Leave blank to use the installed model.", divider: false) {

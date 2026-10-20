@@ -37,11 +37,11 @@
 3. Open Orator. It asks for two permissions:
    - **Microphone**, so it can hear you.
    - **Accessibility**, so it can type into other apps.
-4. On first launch, Orator sets up its speech engine and downloads the speech model (about 3 GB in total, once). After that it works fully offline.
+4. On first launch, Orator sets up its speech engine and downloads the speech model (about 1.3 GB in total, once). After that it works fully offline.
 
 Then hold **fn** (or your chosen shortcut) in any app and speak.
 
-**Requirements:** a Mac with Apple Silicon, macOS 14 Sonoma or later, about 4 GB of free disk space. 8 GB of memory is enough.
+**Requirements:** a Mac with Apple Silicon, macOS 14 Sonoma or later, about 2 GB of free disk space. 8 GB of memory is plenty.
 
 ## Using Orator
 
@@ -70,7 +70,19 @@ The default shortcut is **fn**. You can pick any modifier, a key combination, or
 - Failed recordings are kept for up to 24 hours so you can recover them, or not at all if you turn that off.
 - Transcripts are kept in memory only and never saved to disk.
 - The speech engine runs in a separate process that is blocked from making network connections.
-- The only downloads happen once, during setup: the Python runtime and a pinned, checksum-verified revision of the model.
+- The only downloads happen once, during setup: the Python runtime and a pinned, checksum-verified build of the model.
+
+## Speech model
+
+Orator uses NVIDIA's Parakeet TDT 0.6B v3 with its encoder quantized to 8 bits. The quantized build is published as a [release asset](https://github.com/DevStrategist/orator/releases/tag/speech-model-v1) and can be reproduced with `scripts/quantize_model.py`. On an Apple Silicon MacBook, against the full-precision weights:
+
+| | Full precision | 8-bit encoder (used) |
+| --- | --- | --- |
+| Download | 2.5 GB | 755 MB |
+| Memory while transcribing | 1.9 GB | 1.1 GB |
+| Speed | 16× real time | 22× real time |
+| Model load | 2.7 s | 0.5 s |
+| Transcripts | Reference | Identical on every benchmark clip |
 
 ## Build from source
 

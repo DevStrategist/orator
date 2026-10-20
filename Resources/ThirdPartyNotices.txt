@@ -15,13 +15,14 @@ A copy of uv is bundled to install the speech engine on first launch.
 
 Parakeet TDT 0.6B v3 model
 Original model: NVIDIA, nvidia/parakeet-tdt-0.6b-v3.
-MLX conversion distributed by mlx-community.
+MLX conversion distributed by mlx-community (revision ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15).
 Model weights are licensed under Creative Commons Attribution 4.0 International:
 https://creativecommons.org/licenses/by/4.0/
 https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
 https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3
-Orator downloads a pinned revision of the MLX-converted weights once during
-setup, uses them for local inference only, and does not modify them.
+Changes: Orator's distributed build quantizes the encoder weights to 8 bits
+(group size 64) with scripts/quantize_model.py; all other weights are unchanged.
+It is downloaded once during setup and used for local inference only.
 
 Python dependencies and their licenses are retained in the installed runtime's
 site-packages distribution metadata under:
