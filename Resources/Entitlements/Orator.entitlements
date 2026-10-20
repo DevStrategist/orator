@@ -2,6 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!-- The capture helper runs as Orator's child, so macOS attributes its microphone request to Orator. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
     <!-- Pausing Spotify or Music while dictating, when the user turns it on. -->
     <key>com.apple.security.automation.apple-events</key>
     <true/>

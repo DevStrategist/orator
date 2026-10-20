@@ -128,7 +128,11 @@ final class Insertion {
         let currentGeneration = UUID()
         generation = currentGeneration
         lastVerified = nil
-        guard !IsSecureEventInputEnabled(), let target, !target.isSecure,
+        guard let target else {
+            completion("No text field was selected. Click where you want the text, then dictate again. This transcript is ready to copy.", false)
+            return
+        }
+        guard !IsSecureEventInputEnabled(), !target.isSecure,
               let current = TargetSnapshot.capture(), !current.isSecure else {
             completion("Target or cursor changed. Transcript saved here; use Copy last.", false); return
         }
