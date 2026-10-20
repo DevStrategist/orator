@@ -379,4 +379,33 @@ final class IntegrationTests: XCTestCase {
         XCTAssertNil(controller.notice)
         XCTAssertEqual(controller.phase, .idle)
     }
+    func testListeningCueWaitsForRealAudio() {
+        let controller = readyController { _ in }
+        controller.keyDown()
+        guard let id = controller.machine.id else { return XCTFail("No session") }
+        controller.captureMessage(["event": "recording", "id": id])
+        XCTAssertEqual(controller.phase, .recording)
+        XCTAssertFalse(controller.micLive)
+        XCTAssertEqual(controller.message, "Starting")
+        controller.captureMessage(["event": "live", "id": id, "warmup": 0.6])
+        XCTAssertTrue(controller.micLive)
+        XCTAssertEqual(controller.message, "Listening")
+    }
+    func testListeningCueFallsBackWhenMicNeverGoesLive() {
+        let controller = readyController { _ in }
+        controller.keyDown()
+        guard let id = controller.machine.id else { return XCTFail("No session") }
+        controller.captureMessage(["event": "recording", "id": id])
+        let waited = expectation(description: "fallback")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.7) { waited.fulfill() }
+        wait(for: [waited], timeout: 3)
+        XCTAssertTrue(controller.micLive)
+    }
+    func testTargetIsReadAfterCaptureStarts() {
+        var order: [String] = []
+        let controller = readyController { order.append($0) }
+        controller.targetProvider = { order.append("target"); return nil }
+        controller.keyDown()
+        XCTAssertEqual(order, ["start", "target"])
+    }
 }

@@ -757,7 +757,7 @@ struct RecordingHUD: View {
     private enum State: Equatable { case listening, opening, transcribing, notice }
     private var state: State {
         switch app.phase {
-        case .recording: return .listening
+        case .recording: return app.micLive ? .listening : .opening
         case .starting: return .opening
         case .stopping, .transcribing: return .transcribing
         default: return .notice
@@ -792,7 +792,7 @@ struct RecordingHUD: View {
             }
         case .opening:
             Waveform(level: 0, active: false, color: Theme.faint).padding(.leading, 4)
-            Text(app.message == "Opening microphone…" ? "Starting" : app.message)
+            Text(["Opening microphone…", "Starting", "Listening"].contains(app.message) ? "Starting" : app.message)
                 .foregroundStyle(Theme.slate).lineLimit(1).padding(.trailing, 4)
         case .transcribing:
             ProgressDots().padding(.leading, 6)

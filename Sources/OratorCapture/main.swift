@@ -46,6 +46,9 @@ private final class Recorder {
     var windows: [Double] = []
     var deviceInfo: [String: Any] = [:]
     var heardSignal = false
+    var live = false
+    var liveRun = 0
+    var zeroStreak = 0
     var reportedSilent = false
     var recovery: Recovery?
     var keepRecovery = true
@@ -113,6 +116,7 @@ private final class Recorder {
         do {
             samples = 0; lastCheckpoint = 0; lastLevel = 0; failure = nil
             zeroRun = 0; heardSignal = false; reportedSilent = false
+            live = false; liveRun = 0; zeroStreak = 0
             windowSquares = 0; windowSamples = 0; windows = []; deviceInfo = [:]
             configurationRestarts = 0; stopReason = "user"
             keepRecovery = !(request["neverStore"] as? Bool ?? false)
@@ -268,6 +272,18 @@ private final class Recorder {
             if windowSamples >= 4000 {
                 if windows.count < 4800 { windows.append(sqrt(windowSquares / Double(windowSamples))) }
                 windowSquares = 0; windowSamples = 0
+            }
+            if !live {
+                // Built-in microphones deliver exact zeros while powering up; only real audio means "speak now".
+                for i in 0..<count {
+                    if pointer[i] == 0 { zeroStreak += 1; if zeroStreak >= CapturePolicy.warmupZeroRun { liveRun = 0 } }
+                    else { zeroStreak = 0; liveRun += 1 }
+                }
+                if liveRun >= CapturePolicy.liveSamples {
+                    live = true
+                    let warmup = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1e9
+                    emit(["event": "live", "id": current.id, "warmup": warmup, "atSample": max(0, samples - liveRun)])
+                }
             }
             var lastNonZero = -1
             for i in stride(from: count - 1, through: 0, by: -1) where pointer[i] != 0 { lastNonZero = i; break }

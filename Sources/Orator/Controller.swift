@@ -39,6 +39,8 @@ final class Controller: NSObject, ObservableObject {
     @Published var secureInput = false
     @Published var fnKeyAvailable = true
     @Published var silentInput = false
+    @Published var micLive = false
+    private var micWarmup = 0.0
     @Published var handsFree = false
     @Published var lowSignal = false
     @Published var undoAvailable = false
@@ -464,7 +466,9 @@ final class Controller: NSObject, ObservableObject {
         defaults.set(now, forKey: "tip." + key)
         return true
     }
-    func begin(target: TargetSnapshot?) {
+    /// The target is read after capture starts: Accessibility queries can take hundreds of milliseconds,
+    /// and the microphone should already be warming up meanwhile.
+    func begin(target: @autoclosure () -> TargetSnapshot?) {
         startAttempts += 1
         if phase == .failed {
             // Keep prior recovery files; a fresh recording gets a new session UUID.
@@ -499,7 +503,7 @@ final class Controller: NSObject, ObservableObject {
         guard machine.begin(id) else { return }
         acceptedStarts += 1
         captureBeganAt = ProcessInfo.processInfo.systemUptime
-        self.target = target
+        self.target = nil
         sessionSettings = settings
         if captureDiagnostic == "running" {
             diagnosticSessionID = id
@@ -508,7 +512,7 @@ final class Controller: NSObject, ObservableObject {
             sessionSettings.toggleMode = false
         }
         phaseStarted = ProcessInfo.processInfo.systemUptime; lastEvent = phaseStarted
-        seconds = 0; level = 0; silentInput = false; lowSignal = false; quietSince = nil
+        seconds = 0; level = 0; silentInput = false; lowSignal = false; quietSince = nil; micLive = false
         lidBlocksMicrophone = false; inputTransport = ""
         editWatch?.invalidate(); editWatch = nil
         expireUndo()
@@ -518,6 +522,23 @@ final class Controller: NSObject, ObservableObject {
                             "maxSeconds": sessionSettings.maxSeconds, "neverStore": sessionSettings.neverStore]) else {
             fail("Cannot start capture service."); return
         }
+        let snapshot = target()
+        if machine.id == id { self.target = snapshot }
+    }
+    /// Real audio is flowing: now it's true to say "Listening".
+    func goLive(_ id: String) {
+        guard machine.id == id, phase == .recording, !micLive else { return }
+        micLive = true; message = "Listening"
+        if sessionSettings.sounds { NSSound(named: "Tink")?.play() }
+        if sessionSettings.muteWhileDictating || sessionSettings.pauseMediaWhileDictating {
+            // Let the start sound finish before silencing other audio.
+            let pause = sessionSettings.pauseMediaWhileDictating
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, self.phase == .recording, self.machine.id == id else { return }
+                if pause { self.mediaPause.pause() } else { self.outputMute.mute() }
+            }
+        }
+        onChange?()
     }
     func stopRecording() {
         guard let id = machine.id else { return }
@@ -556,19 +577,19 @@ final class Controller: NSObject, ObservableObject {
         case "recording":
             captureStartLatency = max(0, lastEvent - captureBeganAt)
             guard machine.advance(id, to: .recording) else { return }
-            phaseStarted = lastEvent; message = "Listening"
-            if sessionSettings.sounds { NSSound(named: "Tink")?.play() }
+            phaseStarted = lastEvent; message = "Starting"
+            // Never leave the user waiting on a cue: a muted mic gets its own hint instead.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, self.machine.id == id, self.phase == .recording, !self.micLive else { return }
+                self.goLive(id)
+            }
             inputTransport = object["transport"] as? String ?? ""
             lidBlocksMicrophone = inputTransport == "builtIn" && object["clamshell"] as? Bool == true
-            if sessionSettings.muteWhileDictating || sessionSettings.pauseMediaWhileDictating {
-                // Let the start sound finish before silencing other audio.
-                let pause = sessionSettings.pauseMediaWhileDictating
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    guard let self, self.phase == .recording, self.machine.id == id else { return }
-                    if pause { self.mediaPause.pause() } else { self.outputMute.mute() }
-                }
-            }
             publish()
+        case "live":
+            micWarmup = object["warmup"] as? Double ?? 0
+            captureStartLatency = max(0, lastEvent - captureBeganAt)
+            goLive(id)
         case "level":
             level = object["level"] as? Double ?? 0
             seconds = object["seconds"] as? Double ?? 0
@@ -981,7 +1002,7 @@ final class Controller: NSObject, ObservableObject {
             "lastFailureReason": lastFailureReason ?? "",
             "keyboard": keys.diagnostics(),
             "startAttempts": startAttempts, "acceptedStarts": acceptedStarts,
-            "releaseBeforeAudio": earlyReleases, "captureStartLatency": captureStartLatency,
+            "releaseBeforeAudio": earlyReleases, "captureStartLatency": captureStartLatency, "micWarmup": micWarmup,
             "captureDiagnostic": captureDiagnostic, "diagnosticSamples": diagnosticSamples,
             "diagnosticDetail": diagnosticDetail, "textInsertionDiagnostic": textInsertionDiagnostic,
             "pendingRecoveryCount": recoveries.count, "updatedAt": Date().timeIntervalSince1970,
