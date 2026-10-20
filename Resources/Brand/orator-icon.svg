@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Orator</title>
+  <defs>
+    <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E1B7E"/>
+      <stop offset="1" stop-color="#0F0929"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#7B5CFF" stop-opacity="0.55"/>
+      <stop offset="0.6" stop-color="#5B3DF5" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#5B3DF5" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0.15" y1="0.1" x2="0.85" y2="0.95">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.5" stop-color="#C9BCFF"/>
+      <stop offset="1" stop-color="#8E72FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#field)"/>
+  <!-- Light behind the O, as if it were speaking into the room -->
+  <circle cx="512" cy="512" r="380" fill="url(#glow)"/>
+  <circle cx="512" cy="512" r="208" fill="none" stroke="url(#ring)" stroke-width="64"/>
+</svg>

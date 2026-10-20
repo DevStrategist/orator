@@ -1,0 +1,17 @@
+# Build output
+.build/
+.swiftpm/
+dist/
+*.dmg
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local-only material, never published
+research/
+tools/
+
+# macOS
+.DS_Store

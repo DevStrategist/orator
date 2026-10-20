@@ -1,0 +1,31 @@
+Orator: third-party acknowledgements
+
+Parakeet-MLX 0.5.3
+Copyright its contributors. Apache License 2.0.
+https://github.com/senstella/parakeet-mlx
+
+MLX
+Copyright Apple Inc. and contributors. MIT License.
+https://github.com/ml-explore/mlx
+
+uv
+Copyright Astral Software Inc. Dual-licensed under the MIT License and Apache License 2.0.
+https://github.com/astral-sh/uv
+A copy of uv is bundled to install the speech engine on first launch.
+
+Parakeet TDT 0.6B v3 model
+Original model: NVIDIA, nvidia/parakeet-tdt-0.6b-v3.
+MLX conversion distributed by mlx-community.
+Model weights are licensed under Creative Commons Attribution 4.0 International:
+https://creativecommons.org/licenses/by/4.0/
+https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3
+Orator downloads a pinned revision of the MLX-converted weights once during
+setup, uses them for local inference only, and does not modify them.
+
+Python dependencies and their licenses are retained in the installed runtime's
+site-packages distribution metadata under:
+~/Library/Application Support/Orator/runtime/.venv/
+Exact dependency versions are recorded in runtime/uv.lock.
+
+Orator is an independent project, not affiliated with NVIDIA, Apple or Astral.
