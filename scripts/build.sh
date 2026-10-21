@@ -2,8 +2,8 @@
 # Builds and signs dist/Orator.app. RELEASE=1 adds secure timestamps for notarization.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="1.0.0"
-BUILD="5"
+VERSION="1.1.0"
+BUILD="6"
 IDENTITY="$(python3 "$ROOT/scripts/signing_identity.py")"
 UV="$(command -v uv)" || { printf '%s\n' 'uv is required to build: https://docs.astral.sh/uv/'; exit 1; }
 if [ "$IDENTITY" = "-" ]; then
