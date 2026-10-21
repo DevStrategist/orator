@@ -164,6 +164,7 @@ final class Controller: NSObject, ObservableObject {
         watchdog = timer
         startCapture(); startWorker()
         refreshPermissions()
+        Cues.preload()
     }
 
     func cleanOrphans() {
@@ -529,7 +530,7 @@ final class Controller: NSObject, ObservableObject {
     func goLive(_ id: String) {
         guard machine.id == id, phase == .recording, !micLive else { return }
         micLive = true; message = "Listening"
-        if sessionSettings.sounds { NSSound(named: "Tink")?.play() }
+        if sessionSettings.sounds { Cues.playStart() }
         if sessionSettings.muteWhileDictating || sessionSettings.pauseMediaWhileDictating {
             // Let the start sound finish before silencing other audio.
             let pause = sessionSettings.pauseMediaWhileDictating
@@ -610,7 +611,7 @@ final class Controller: NSObject, ObservableObject {
                 publish()
             }
             guard phase == .stopping else { return }
-            if sessionSettings.sounds { NSSound(named: "Pop")?.play() }
+            if sessionSettings.sounds { Cues.playStop() }
             guard (object["samples"] as? Int ?? 0) >= 160 else {
                 OratorPaths.remove(id); machine.cancel(); publish()
                 showNotice("No audio captured. Hold \(settings.hotkey.label) until Listening appears, or use press-to-toggle mode.")

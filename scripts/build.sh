@@ -52,6 +52,7 @@ shutil.copy2(root / "Resources/ThirdPartyNotices.txt", resources / "ThirdPartyNo
 shutil.copy2(root / "LICENSE", resources / "LICENSE.txt")
 shutil.copy2(root / "Resources/Brand/Orator.icns", resources / "Orator.icns")
 shutil.copy2(root / "Resources/Brand/orator-mark.svg", resources / "orator-mark.svg")
+shutil.copytree(root / "Resources/Sounds", resources / "Sounds", dirs_exist_ok=True)
 # The bundled uv installs the speech engine on first launch.
 shutil.copy2(os.environ["UV"], app / "Contents/Helpers/uv")
 print("Packaged:", app)

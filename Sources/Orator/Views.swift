@@ -550,7 +550,9 @@ private struct MicrophonePage: View {
                 }
             }
             SettingsGroup {
-                Row(title: "Play start and stop sounds", divider: false) { Switch(isOn: $app.settings.sounds) }
+                Row(title: "Play start and stop sounds", divider: false) {
+                    Switch(isOn: $app.settings.sounds).onChange(of: app.settings.sounds) { _, on in if on { Cues.playStart() } }
+                }
             }
         }.disabled(app.busy)
     }
