@@ -13,6 +13,7 @@ let package = Package(
         .executableTarget(name: "Orator", dependencies: ["OratorCore"]),
         .executableTarget(name: "OratorCapture", dependencies: ["OratorCore"]),
         .testTarget(name: "OratorCoreTests", dependencies: ["OratorCore"]),
-        .testTarget(name: "OratorTests", dependencies: ["Orator", "OratorCore"])
+        .testTarget(name: "OratorTests", dependencies: ["Orator", "OratorCore"]),
+        .testTarget(name: "OratorCaptureTests", dependencies: ["OratorCapture", "OratorCore"])
     ]
 )

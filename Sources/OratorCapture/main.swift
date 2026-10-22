@@ -15,7 +15,7 @@ private func emit(_ message: [String: Any]) {
     try? FileHandle.standardOutput.write(contentsOf: data + Data([10]))
 }
 
-private final class CaptureToken {
+final class CaptureToken {
     let id: String
     let lock = NSLock()
     var cancelled = false
@@ -27,7 +27,7 @@ private final class CaptureToken {
     var shouldStop: Bool { lock.lock(); defer { lock.unlock() }; return stopRequested }
 }
 
-private final class Recorder {
+final class Recorder {
     let graph = DispatchQueue(label: "orator.capture.graph", qos: .userInitiated)
     let writer = DispatchQueue(label: "orator.capture.writer", qos: .userInitiated)
     let slots = DispatchSemaphore(value: 32)
@@ -35,6 +35,13 @@ private final class Recorder {
     var token: CaptureToken?
     var engine: AVAudioEngine?
     var engineDeviceUID = ""
+    var tapInstalled = false
+    var captureGeneration: UUID?
+    var recordingDevice: AudioDeviceID?
+    var announcedRecording = false
+    var graphStartedAt: UInt64 = 0
+    var lastObservedSamples = 0
+    var silentStartRetried = false
     var observer: NSObjectProtocol?
     var file: FileHandle?
     var converter: AVAudioConverter?
@@ -47,6 +54,7 @@ private final class Recorder {
     var windows: [Double] = []
     var deviceInfo: [String: Any] = [:]
     var heardSignal = false
+    var graphHeardSignal = false
     var live = false
     var liveRun = 0
     var zeroStreak = 0
@@ -124,7 +132,7 @@ private final class Recorder {
 
     func prepareEngine(_ uid: String) throws -> AVAudioEngine {
         if let engine, engineDeviceUID == uid, let device = deviceID(uid),
-           currentDevice(engine.inputNode.audioUnit) == device { return engine }
+           currentDevice(engine.inputNode.audioUnit) == device, transport(device) != "bluetooth" { return engine }
         let audio = AVAudioEngine()
         if !uid.isEmpty {
             guard let selectedDevice = deviceID(uid), let unit = audio.inputNode.audioUnit else {
@@ -146,6 +154,151 @@ private final class Recorder {
         return audio
     }
 
+    func flushConverter(_ current: CaptureToken) {
+        if let converter,
+           let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
+                                      channels: 1, interleaved: true),
+           let tail = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4096) {
+            var error: NSError?
+            converter.convert(to: tail, error: &error) { _, status in
+                status.pointee = .endOfStream; return nil
+            }
+            if error == nil { write(tail, current) }
+        }
+        converter = nil
+    }
+
+    func releaseEngine(_ current: CaptureToken) {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        if let engine {
+            if tapInstalled { engine.inputNode.removeTap(onBus: 0) }
+            engine.stop()
+        }
+        tapInstalled = false; engine = nil
+        // Drain the old format before installing its replacement in the same recording.
+        writer.sync {
+            flushConverter(current)
+            captureGeneration = nil; graphHeardSignal = false
+        }
+    }
+
+    func startEngine(_ uid: String, _ current: CaptureToken) throws -> Bool {
+        try CapturePolicy.retryStart(shouldStop: { current.shouldStop }) {
+            do { try self.configureAndStart(uid, current) }
+            catch { self.releaseEngine(current); throw error }
+        }
+    }
+
+    func configureAndStart(_ uid: String, _ current: CaptureToken) throws {
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            current.stop(cancel: false)
+            failure = "Microphone permission is required"
+            return
+        }
+        let audio = try prepareEngine(uid)
+        let input = audio.inputNode.outputFormat(forBus: 0)
+        guard input.sampleRate > 0, input.channelCount > 0,
+              let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
+                                        channels: 1, interleaved: true),
+              let conversion = AVAudioConverter(from: input, to: target) else {
+            throw NSError(domain: "Microphone format is unavailable", code: 4)
+        }
+        let initialDevice = currentDevice(audio.inputNode.audioUnit)
+        if let recordingDevice, initialDevice != recordingDevice {
+            throw NSError(domain: "Microphone changed; captured audio is available to recover", code: 6)
+        }
+        recordingDevice = initialDevice
+        let generation = UUID()
+        writer.sync {
+            converter = conversion; captureGeneration = generation; graphHeardSignal = false
+            live = false; liveRun = 0; zeroStreak = 0; zeroRun = 0; reportedSilent = false
+        }
+        if let initialDevice {
+            deviceInfo = ["transport": transport(initialDevice), "clamshell": lidClosed()]
+        }
+        audio.inputNode.installTap(onBus: 0, bufferSize: 1024, format: input) { [weak self, weak current] buffer, _ in
+            guard let self, let current else { return }
+            guard self.slots.wait(timeout: .now()) == .success else {
+                self.graph.async {
+                    guard !current.shouldStop, self.captureGeneration == generation else { return }
+                    self.failure = "Audio queue overflow; partial recording retained"; self.stop(current.id)
+                }
+                return
+            }
+            guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {
+                self.slots.signal(); return
+            }
+            copy.frameLength = buffer.frameLength
+            let from = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+            let to = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+            for index in 0..<from.count {
+                if let source = from[index].mData, let dest = to[index].mData {
+                    memcpy(dest, source, Int(from[index].mDataByteSize))
+                }
+            }
+            self.writer.async {
+                defer { self.slots.signal() }
+                self.consume(copy, current, target, conversion, generation: generation)
+            }
+        }
+        tapInstalled = true
+        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                                           object: audio, queue: nil) { [weak self] _ in
+            self?.graph.async {
+                guard let self, self.engine === audio, self.token?.id == current.id, !current.stopped,
+                      !current.shouldStop else { return }
+                let actualFormat = audio.inputNode.outputFormat(forBus: 0)
+                let currentHardware = currentDevice(audio.inputNode.audioUnit)
+                let changedDevice = initialDevice != nil && currentHardware != nil && initialDevice != currentHardware
+                let sameFormat = actualFormat.sampleRate == input.sampleRate &&
+                                 actualFormat.channelCount == input.channelCount
+                switch CapturePolicy.configurationChange(running: audio.isRunning,
+                    formatUnchanged: sameFormat, deviceChanged: changedDevice,
+                    restarts: self.configurationRestarts) {
+                case .keepRecording: break
+                case .restartOnce:
+                    self.recover(current)
+                case .interrupt:
+                    self.failure = changedDevice ? "Microphone changed; captured audio is available to recover" :
+                        "Audio configuration changed repeatedly; captured audio is available to recover"
+                    self.stop(current.id)
+                }
+            }
+        }
+        guard !current.shouldStop else { return }
+        audio.prepare()
+        try writer.sync {
+            try audio.start()
+            graphStartedAt = DispatchTime.now().uptimeNanoseconds
+            lastAudioAt = graphStartedAt; lastObservedSamples = samples
+            if !announcedRecording {
+                startedAt = graphStartedAt; announcedRecording = true
+                emit(["event": "recording", "id": current.id].merging(deviceInfo) { a, _ in a })
+            }
+        }
+    }
+
+    func recover(_ current: CaptureToken) {
+        guard !current.shouldStop, !current.stopped, token?.id == current.id else { return }
+        guard configurationRestarts < CapturePolicy.maxConfigurationRestarts else {
+            failure = "Microphone stopped delivering audio; captured audio is available to recover"
+            stop(current.id); return
+        }
+        configurationRestarts += 1
+        let uid = engineDeviceUID
+        releaseEngine(current)
+        emit(["event": "recovering", "id": current.id, "attempt": configurationRestarts])
+        do {
+            let started = try startEngine(uid, current)
+            if !started || current.shouldStop { stop(current.id, cancel: current.isCancelled) }
+        } catch {
+            let detail = error as NSError
+            failure = "Microphone recovery failed (\(detail.domain), \(detail.code)); captured audio is available to recover"
+            stop(current.id)
+        }
+    }
+
     func start(_ request: [String: Any], _ current: CaptureToken) {
         do {
             samples = 0; lastCheckpoint = 0; lastLevel = 0; failure = nil
@@ -153,6 +306,8 @@ private final class Recorder {
             live = false; liveRun = 0; zeroStreak = 0
             windowSquares = 0; windowSamples = 0; windows = []; deviceInfo = [:]
             configurationRestarts = 0; stopReason = "user"
+            recordingDevice = nil; announcedRecording = false; silentStartRetried = false
+            startedAt = 0; graphStartedAt = 0; lastObservedSamples = 0
             keepRecovery = !(request["neverStore"] as? Bool ?? false)
             guard !current.shouldStop else { finish(current, cancelled: current.isCancelled); return }
             guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
@@ -169,100 +324,38 @@ private final class Recorder {
             }
             file = try FileHandle(forWritingTo: path)
             samples = 0; lastCheckpoint = 0; failure = nil
-            let audio = try prepareEngine(request["device"] as? String ?? "")
-            let input = audio.inputNode.outputFormat(forBus: 0)
-            guard input.sampleRate > 0, input.channelCount > 0,
-                  let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
-                                            channels: 1, interleaved: true),
-                  let conversion = AVAudioConverter(from: input, to: target) else {
-                throw NSError(domain: "Microphone format is unavailable", code: 4)
+            let started: Bool
+            do { started = try startEngine(request["device"] as? String ?? "", current) }
+            catch {
+                let detail = error as NSError
+                let holders = microphoneHolders()
+                let hint = holders.isEmpty ? "Try again or pick another input in Settings." :
+                    "\(holders.prefix(3).joined(separator: ", ")) may be using it."
+                throw NSError(domain: "Microphone unavailable (\(detail.domain), \(detail.code)). \(hint)", code: 5)
             }
-            converter = conversion
-            let initialDevice = currentDevice(audio.inputNode.audioUnit)
-            if let initialDevice {
-                deviceInfo = ["transport": transport(initialDevice), "clamshell": lidClosed()]
-            }
-            audio.inputNode.installTap(onBus: 0, bufferSize: 1024, format: input) { [weak self, weak current] buffer, _ in
-                guard let self, let current else { return }
-                guard self.slots.wait(timeout: .now()) == .success else {
-                    self.graph.async { self.failure = "Audio queue overflow; partial recording retained"; self.stop(current.id) }
-                    return
-                }
-                guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {
-                    self.slots.signal(); return
-                }
-                copy.frameLength = buffer.frameLength
-                let from = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-                let to = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
-                for index in 0..<from.count {
-                    if let source = from[index].mData, let dest = to[index].mData {
-                        memcpy(dest, source, Int(from[index].mDataByteSize))
-                    }
-                }
-                self.writer.async {
-                    defer { self.slots.signal() }
-                    self.consume(copy, current, target)
-                }
-            }
-            observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-                                                               object: audio, queue: nil) { [weak self] _ in
-                self?.graph.async {
-                    guard let self, self.token?.id == current.id, !current.stopped,
-                          !current.shouldStop else { return }
-                    let actualFormat = audio.inputNode.outputFormat(forBus: 0)
-                    let currentHardware = currentDevice(audio.inputNode.audioUnit)
-                    let changedDevice = initialDevice != nil && currentHardware != nil && initialDevice != currentHardware
-                    let sameFormat = actualFormat.sampleRate == input.sampleRate &&
-                                     actualFormat.channelCount == input.channelCount
-                    switch CapturePolicy.configurationChange(running: audio.isRunning,
-                        formatUnchanged: sameFormat, deviceChanged: changedDevice,
-                        restarts: self.configurationRestarts) {
-                    case .keepRecording: break
-                    case .restartOnce:
-                        self.configurationRestarts += 1
-                        do { audio.prepare(); try audio.start() }
-                        catch {
-                            self.failure = "Audio engine could not recover its configuration"
-                            self.stop(current.id)
-                        }
-                    case .interrupt:
-                        self.failure = "Audio device or format changed; captured audio is available to recover"
-                        self.stop(current.id)
-                    }
-                }
-            }
-            guard !current.shouldStop else { stop(current.id, cancel: current.isCancelled); return }
-            var retries = CapturePolicy.startRetryDelays[...]
-            while true {
-                do {
-                    audio.prepare()
-                    try writer.sync {
-                        try audio.start()
-                        startedAt = DispatchTime.now().uptimeNanoseconds
-                        emit(["event": "recording", "id": current.id].merging(deviceInfo) { a, _ in a })
-                    }
-                    break
-                }
-                catch {
-                    guard let delay = retries.popFirst(), !current.shouldStop else {
-                        let holders = microphoneHolders()
-                        throw NSError(domain: holders.isEmpty ? "Microphone unavailable. The audio driver may be stuck; try again or pick another input." :
-                            "Microphone unavailable. \(holders.prefix(3).joined(separator: ", ")) may be using it.", code: 5)
-                    }
-                    usleep(UInt32(delay * 1_000_000))
-                    guard !current.shouldStop else { stop(current.id, cancel: current.isCancelled); return }
-                }
-            }
-            lastAudioAt = startedAt
+            guard started, !current.shouldStop else { stop(current.id, cancel: current.isCancelled); return }
             let maxSeconds = min(1200, max(10, request["maxSeconds"] as? Int ?? 300))
             let timer = DispatchSource.makeTimerSource(queue: graph)
             timer.schedule(deadline: .now() + 1, repeating: 1)
             timer.setEventHandler { [weak self] in
                 guard let self else { return }
-                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - self.startedAt) / 1e9
+                guard !current.shouldStop, !current.stopped else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                let elapsed = Double(now - self.startedAt) / 1e9
                 if elapsed >= Double(maxSeconds) {
                     self.stopReason = "limit"
                     self.stop(current.id)
+                    return
+                }
+                let health = self.writer.sync { (self.samples, self.graphHeardSignal) }
+                if health.0 != self.lastObservedSamples {
+                    self.lastObservedSamples = health.0; self.lastAudioAt = now
+                }
+                if CapturePolicy.needsAudioRecovery(callbackAge: Double(now - self.lastAudioAt) / 1e9,
+                    startupAge: Double(now - self.graphStartedAt) / 1e9, heardSignal: health.1,
+                    silentStartRetried: self.silentStartRetried) {
+                    if !health.1 { self.silentStartRetried = true }
+                    self.recover(current)
                 }
             }
             self.timer = timer; timer.resume()
@@ -272,8 +365,9 @@ private final class Recorder {
         }
     }
 
-    func consume(_ input: AVAudioPCMBuffer, _ current: CaptureToken, _ target: AVAudioFormat) {
-        guard let converter, file != nil else { return }
+    func consume(_ input: AVAudioPCMBuffer, _ current: CaptureToken, _ target: AVAudioFormat,
+                 _ converter: AVAudioConverter, generation: UUID) {
+        guard captureGeneration == generation, recovery?.id == current.id, file != nil else { return }
         let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * 16000 / input.format.sampleRate) + 64)
         guard let converted = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
         var supplied = false
@@ -283,7 +377,10 @@ private final class Recorder {
             supplied = true; status.pointee = .haveData; return input
         }
         guard error == nil else {
-            graph.async { self.failure = "Audio conversion failed"; self.stop(current.id) }
+            graph.async {
+                guard !current.shouldStop, self.captureGeneration == generation else { return }
+                self.failure = "Audio conversion failed"; self.stop(current.id)
+            }
             return
         }
         write(converted, current)
@@ -309,14 +406,14 @@ private final class Recorder {
                 }
                 if liveRun >= CapturePolicy.liveSamples {
                     live = true
-                    let warmup = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1e9
+                    let warmup = Double(DispatchTime.now().uptimeNanoseconds - graphStartedAt) / 1e9
                     emit(["event": "live", "id": current.id, "warmup": warmup, "atSample": max(0, samples - liveRun)])
                 }
             }
             var lastNonZero = -1
             for i in stride(from: count - 1, through: 0, by: -1) where pointer[i] != 0 { lastNonZero = i; break }
             if lastNonZero >= 0 {
-                heardSignal = true; zeroRun = count - 1 - lastNonZero
+                heardSignal = true; graphHeardSignal = true; zeroRun = count - 1 - lastNonZero
                 if reportedSilent { reportedSilent = false; emit(["event": "silent", "id": current.id, "silent": false]) }
             } else {
                 zeroRun += count
@@ -361,23 +458,16 @@ private final class Recorder {
             if let observer = self.observer { NotificationCenter.default.removeObserver(observer) }
             self.observer = nil
             if let engine = self.engine {
-                engine.inputNode.removeTap(onBus: 0)
+                if self.tapInstalled { engine.inputNode.removeTap(onBus: 0) }
+                self.tapInstalled = false
                 engine.stop()
-                if self.failure == nil { engine.prepare() }
+                if self.failure == nil && self.deviceInfo["transport"] as? String != "bluetooth" {
+                    engine.prepare()
+                } else { self.engine = nil }
             }
-            if self.failure != nil { self.engine = nil }
             self.writer.async {
-                if let converter = self.converter,
-                   let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
-                                              channels: 1, interleaved: true),
-                   let tail = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4096) {
-                    var error: NSError?
-                    converter.convert(to: tail, error: &error) { _, status in
-                        status.pointee = .endOfStream; return nil
-                    }
-                    if error == nil { self.write(tail, current) }
-                }
-                self.converter = nil
+                self.flushConverter(current)
+                self.captureGeneration = nil
                 do { try self.file?.synchronize(); try self.file?.close() }
                 catch { self.failure = "Recording finalization failed; partial audio retained" }
                 self.file = nil

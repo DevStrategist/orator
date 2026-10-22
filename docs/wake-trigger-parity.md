@@ -1,4 +1,4 @@
-# Wake and shortcut behavior
+# Recording, wake and shortcut behavior
 
 | Behavior | Orator implementation |
 | --- | --- |
@@ -12,6 +12,10 @@
 | Normalize Caps Lock after 50, 150, 400 and 1,000 ms | HID press/release handling; delayed work expires on pause or binding change |
 | Recover system activation by polling, in addition to wake signals | One-second console/login/lock-state sampling and wake/unlock notifications |
 | Allow a responsive helper time to recover after wake | Twelve-second capture IPC and worker ping deadlines before restarting an unresponsive service |
+| Signal readiness after real microphone audio arrives | Immediate rounded opening popup; Listening and its sound follow usable PCM rather than engine startup |
+| Recover same-device format changes | Rebuild the engine, tap and converter with bounded retries; drain old PCM and reject retired graph callbacks |
+| Detect a stalled or silent microphone | Repair missing callbacks after five seconds; allow one silent-start reopen after six seconds of exact zeros, without rejecting quiet valid audio |
+| Release Bluetooth input between dictations | Discard the stopped Bluetooth engine so a later press negotiates a fresh capture format |
 
 Orator keeps its tap installed but paused while locked. Queued shortcut callbacks
 are invalidated on pause, wake, stop and binding changes. A missed sleep signal
@@ -30,6 +34,6 @@ Regression coverage is in `GestureTests`, `ShortcutPolicyTests`, `HotkeysTests`
 and `IntegrationTests`. Run `scripts/test.sh`; build the signed application with
 `scripts/build.sh`.
 
-Validated on 2026-10-22: 142 Swift tests passed, including UI snapshots,
-19 Python tests passed, signed release build verified, and the installed app's
-Fn event/capture/drain diagnostic passed. Its executable matches the signed build.
+Capture regression coverage also uses real converters with synthetic PCM to
+check format replacement, final draining and retired graph/session rejection.
+Bluetooth profile transitions require live verification with the affected headset.

@@ -529,15 +529,37 @@ final class IntegrationTests: XCTestCase {
         XCTAssertNil(controller.notice)
         XCTAssertEqual(controller.phase, .idle)
     }
-    func testListeningCueFollowsEngineStart() {
+    func testListeningCueWaitsForRealAudio() {
         let controller = readyController { _ in }
         controller.settings.sounds = false
         controller.keyDown()
         guard let id = controller.machine.id else { return XCTFail("No session") }
         controller.captureMessage(["event": "recording", "id": id])
         XCTAssertEqual(controller.phase, .recording)
+        XCTAssertFalse(controller.micLive)
+        XCTAssertNotEqual(controller.message, "Listening")
+        controller.captureMessage(["event": "live", "id": id, "warmup": 0.5])
         XCTAssertTrue(controller.micLive)
         XCTAssertEqual(controller.message, "Listening")
+    }
+    func testRecoveringMicrophoneWaitsForFreshAudio() {
+        let controller = readyController { _ in }
+        controller.settings.sounds = false
+        controller.keyDown()
+        guard let id = controller.machine.id else { return XCTFail("No session") }
+        controller.captureMessage(["event": "recording", "id": id])
+        controller.captureMessage(["event": "live", "id": id])
+        XCTAssertTrue(controller.micLive)
+        controller.captureMessage(["event": "recovering", "id": id])
+        XCTAssertEqual(controller.phase, .recording)
+        XCTAssertFalse(controller.micLive)
+        XCTAssertNotEqual(controller.message, "Listening")
+        controller.captureMessage(["event": "live", "id": id])
+        XCTAssertTrue(controller.micLive)
+        controller.stopRecording()
+        controller.captureMessage(["event": "recovering", "id": id])
+        controller.captureMessage(["event": "live", "id": id])
+        XCTAssertEqual(controller.phase, .stopping)
     }
     func testLateEngineStartCannotReviveStoppedRecording() {
         let controller = readyController { _ in }

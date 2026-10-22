@@ -551,7 +551,7 @@ final class Controller: NSObject, ObservableObject {
         let snapshot = target()
         if machine.id == id { self.target = snapshot }
     }
-    /// The microphone has started; signal quality is reported separately.
+    /// Real audio has arrived; the engine alone can start before a Bluetooth microphone is ready.
     func goLive(_ id: String) {
         guard machine.id == id, phase == .recording, !micLive else { return }
         micLive = true; message = "Listening"
@@ -610,9 +610,14 @@ final class Controller: NSObject, ObservableObject {
             inputTransport = object["transport"] as? String ?? ""
             lidBlocksMicrophone = inputTransport == "builtIn" && object["clamshell"] as? Bool == true
             publish()
-            goLive(id)
         case "live":
             micWarmup = object["warmup"] as? Double ?? 0
+            goLive(id)
+        case "recovering":
+            guard phase == .recording else { return }
+            micLive = false; silentInput = false; lowSignal = false; level = 0
+            message = "Reconnecting microphone…"
+            publish()
         case "level":
             level = object["level"] as? Double ?? 0
             seconds = object["seconds"] as? Double ?? 0
