@@ -118,8 +118,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 }
             }
             layoutHUD()
+            // Draw the rounded content before exposing the window's first frame.
+            hudHost?.layoutSubtreeIfNeeded()
+            hud?.displayIfNeeded()
             hud?.orderFrontRegardless()
-        } else { hud?.orderOut(nil) }
+        } else {
+            hud?.orderOut(nil)
+            // Hidden SwiftUI content otherwise animates the previous notice into the next recording.
+            hudSizing = nil; hudHost = nil; hud = nil
+        }
     }
     func layoutHUD() {
         guard let hud, let host = hudHost, hud.isVisible || controller.hudPhase || controller.notice != nil,

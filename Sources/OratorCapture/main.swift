@@ -34,6 +34,7 @@ private final class Recorder {
     let tokenLock = NSLock()
     var token: CaptureToken?
     var engine: AVAudioEngine?
+    var engineDeviceUID = ""
     var observer: NSObjectProtocol?
     var file: FileHandle?
     var converter: AVAudioConverter?
@@ -77,6 +78,15 @@ private final class Recorder {
             }
             return
         }
+        if op == "prepare" {
+            graph.async {
+                self.tokenLock.lock(); let idle = self.token == nil; self.tokenLock.unlock()
+                guard idle, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
+                do { _ = try self.prepareEngine(request["device"] as? String ?? "") }
+                catch { self.engine = nil }
+            }
+            return
+        }
         if op == "shutdown" {
             tokenLock.lock(); let current = token; tokenLock.unlock()
             if let current {
@@ -112,6 +122,30 @@ private final class Recorder {
         emit(["event": "permissions", "microphone": status])
     }
 
+    func prepareEngine(_ uid: String) throws -> AVAudioEngine {
+        if let engine, engineDeviceUID == uid, let device = deviceID(uid),
+           currentDevice(engine.inputNode.audioUnit) == device { return engine }
+        let audio = AVAudioEngine()
+        if !uid.isEmpty {
+            guard let selectedDevice = deviceID(uid), let unit = audio.inputNode.audioUnit else {
+                throw NSError(domain: "Selected microphone is unavailable", code: 3)
+            }
+            var device = selectedDevice
+            let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                             kAudioUnitScope_Global, 0, &device,
+                                             UInt32(MemoryLayout<AudioDeviceID>.size))
+            guard status == noErr else { throw NSError(domain: "Cannot select microphone", code: Int(status)) }
+        }
+        let input = audio.inputNode.outputFormat(forBus: 0)
+        guard input.sampleRate > 0, input.channelCount > 0 else {
+            throw NSError(domain: "Microphone format is unavailable", code: 4)
+        }
+        // Allocate the graph ahead of key-down without starting microphone capture.
+        audio.prepare()
+        engine = audio; engineDeviceUID = uid
+        return audio
+    }
+
     func start(_ request: [String: Any], _ current: CaptureToken) {
         do {
             samples = 0; lastCheckpoint = 0; lastLevel = 0; failure = nil
@@ -135,18 +169,7 @@ private final class Recorder {
             }
             file = try FileHandle(forWritingTo: path)
             samples = 0; lastCheckpoint = 0; failure = nil
-            let audio = AVAudioEngine()
-            engine = audio
-            if let uid = request["device"] as? String, !uid.isEmpty {
-                guard let selectedDevice = deviceID(uid), let unit = audio.inputNode.audioUnit else {
-                    throw NSError(domain: "Selected microphone is unavailable", code: 3)
-                }
-                var device = selectedDevice
-                let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                                                 kAudioUnitScope_Global, 0, &device,
-                                                 UInt32(MemoryLayout<AudioDeviceID>.size))
-                guard status == noErr else { throw NSError(domain: "Cannot select microphone", code: Int(status)) }
-            }
+            let audio = try prepareEngine(request["device"] as? String ?? "")
             let input = audio.inputNode.outputFormat(forBus: 0)
             guard input.sampleRate > 0, input.channelCount > 0,
                   let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
@@ -211,7 +234,15 @@ private final class Recorder {
             guard !current.shouldStop else { stop(current.id, cancel: current.isCancelled); return }
             var retries = CapturePolicy.startRetryDelays[...]
             while true {
-                do { audio.prepare(); try audio.start(); break }
+                do {
+                    audio.prepare()
+                    try writer.sync {
+                        try audio.start()
+                        startedAt = DispatchTime.now().uptimeNanoseconds
+                        emit(["event": "recording", "id": current.id].merging(deviceInfo) { a, _ in a })
+                    }
+                    break
+                }
                 catch {
                     guard let delay = retries.popFirst(), !current.shouldStop else {
                         let holders = microphoneHolders()
@@ -222,7 +253,6 @@ private final class Recorder {
                     guard !current.shouldStop else { stop(current.id, cancel: current.isCancelled); return }
                 }
             }
-            startedAt = DispatchTime.now().uptimeNanoseconds
             lastAudioAt = startedAt
             let maxSeconds = min(1200, max(10, request["maxSeconds"] as? Int ?? 300))
             let timer = DispatchSource.makeTimerSource(queue: graph)
@@ -264,9 +294,7 @@ private final class Recorder {
         do {
             let count = Int(buffer.frameLength)
             try file?.write(contentsOf: Data(bytes: pointer, count: count * 2))
-            let wasEmpty = samples == 0
             samples += count
-            if wasEmpty { emit(["event": "recording", "id": current.id].merging(deviceInfo) { a, _ in a }) }
             for i in 0..<count { let value = Double(pointer[i]) / 32768; windowSquares += value * value }
             windowSamples += count
             if windowSamples >= 4000 {
@@ -335,8 +363,9 @@ private final class Recorder {
             if let engine = self.engine {
                 engine.inputNode.removeTap(onBus: 0)
                 engine.stop()
+                if self.failure == nil { engine.prepare() }
             }
-            self.engine = nil
+            if self.failure != nil { self.engine = nil }
             self.writer.async {
                 if let converter = self.converter,
                    let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
@@ -450,6 +479,15 @@ private func microphoneHolders() -> [String] {
 }
 
 private func deviceID(_ uid: String) -> AudioDeviceID? {
+    if uid.isEmpty {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var device = AudioDeviceID(0), size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address,
+                                         0, nil, &size, &device) == noErr, device != 0 else { return nil }
+        return device
+    }
     var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
                                              mScope: kAudioObjectPropertyScopeGlobal,
                                              mElement: kAudioObjectPropertyElementMain)

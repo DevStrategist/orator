@@ -21,8 +21,11 @@ public struct PushToTalkGesture {
             self.startedAt = now; locked = false; releasedEarlyAt = nil
             return .start
         }
-        if locked { reset(); return .stop }
-        if let releasedEarlyAt, now - releasedEarlyAt <= Self.debounce || now - startedAt <= Self.debounce * 2 {
+        if locked {
+            let action: GestureAction = now - startedAt < Self.debounce ? .discard : .stop
+            reset(); return action
+        }
+        if releasedEarlyAt != nil, now - startedAt < Self.debounce {
             self.releasedEarlyAt = nil; locked = true
             return .lock
         }

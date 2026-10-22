@@ -47,4 +47,35 @@ final class GestureTests: XCTestCase {
         XCTAssertEqual(gesture.release(now: 1), .stop)
         XCTAssertEqual(gesture.release(now: 1.1), .none)
     }
+    func testDoubleTapWindowStartsAtFirstPress() {
+        var gesture = PushToTalkGesture()
+        _ = gesture.press(now: 0)
+        _ = gesture.release(now: 0.4)
+        XCTAssertEqual(gesture.press(now: 0.6), .none)
+        XCTAssertFalse(gesture.locked)
+        XCTAssertEqual(gesture.expire(now: 0.9), .discard)
+    }
+    func testPressAtDoubleTapBoundaryDoesNotLock() {
+        var gesture = PushToTalkGesture()
+        _ = gesture.press(now: 0)
+        _ = gesture.release(now: 0.1)
+        XCTAssertEqual(gesture.press(now: 0.5), .none)
+        XCTAssertFalse(gesture.locked)
+    }
+    func testQuickTriplePressDiscardsInsteadOfTranscribing() {
+        var gesture = PushToTalkGesture()
+        _ = gesture.press(now: 0)
+        _ = gesture.release(now: 0.1)
+        XCTAssertEqual(gesture.press(now: 0.2), .lock)
+        _ = gesture.release(now: 0.25)
+        XCTAssertEqual(gesture.press(now: 0.3), .discard)
+        XCTAssertFalse(gesture.active)
+    }
+    func testDuplicatePressWithoutReleaseDoesNotLock() {
+        var gesture = PushToTalkGesture()
+        _ = gesture.press(now: 0)
+        XCTAssertEqual(gesture.press(now: 0.2), .none)
+        XCTAssertFalse(gesture.locked)
+        XCTAssertEqual(gesture.release(now: 1), .stop)
+    }
 }

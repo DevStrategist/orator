@@ -106,6 +106,153 @@ final class IntegrationTests: XCTestCase {
         XCTAssertFalse(original.matches(target(1, element, NSRange(location: 3, length: 0), "hello")))
         XCTAssertFalse(original.matches(target(1, element, NSRange(location: 2, length: 0), "changed")))
     }
+    func testShortcutListensAgainAfterWake() {
+        let controller = Controller(startServices: false)
+        controller.sessionActivity = { true }
+        controller.suspend()
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, true)
+        controller.resume()
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, false)
+        // A second wake signal (screen wake, unlock) changes nothing.
+        controller.resume()
+        XCTAssertFalse(controller.sleeping)
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, false)
+    }
+    func testScreenWakeDoesNotResumeLockedSession() {
+        let controller = Controller(startServices: false)
+        controller.sessionActivity = { false }
+        controller.suspend()
+        controller.resume()
+        XCTAssertTrue(controller.sleeping)
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, true)
+    }
+    func testPollingRecoversMissingLockAndUnlockNotifications() {
+        let controller = Controller(startServices: false)
+        var active = false
+        controller.sessionActivity = { active }
+        controller.tick()
+        XCTAssertTrue(controller.sleeping)
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, true)
+        active = true
+        controller.tick()
+        XCTAssertFalse(controller.sleeping)
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, false)
+    }
+    func testUnknownSessionCannotResumeDictation() {
+        let controller = Controller(startServices: false)
+        controller.sessionActivity = { nil }
+        controller.suspend()
+        controller.tick()
+        XCTAssertTrue(controller.sleeping)
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, true)
+    }
+    func testMissedSleepNotificationInvalidatesOldRecordingOnWake() {
+        let controller = readyController { _ in }
+        controller.sessionActivity = { true }
+        controller.keyDown()
+        guard let id = controller.machine.id else { return XCTFail("No session") }
+        controller.wake()
+        XCTAssertFalse(controller.sleeping)
+        XCTAssertFalse(controller.gesture.active)
+        XCTAssertEqual(controller.phase, .failed)
+        controller.workerMessage(["event": "result", "id": id, "text": "late text"])
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertTrue(controller.lastText.isEmpty)
+    }
+    func testTimerGapCannotLeaveTheShortcutPaused() {
+        let controller = readyController { _ in }
+        controller.sessionActivity = { true }
+        controller.keyDown()
+        controller.lastTick = ProcessInfo.processInfo.systemUptime - 8
+        controller.tick()
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertFalse(controller.sleeping)
+        XCTAssertFalse(controller.gesture.active)
+        XCTAssertEqual(controller.keys.diagnostics()["paused"] as? Bool, false)
+    }
+    func testFirstTickAfterWakeDoesNotCancelFreshDictation() {
+        let controller = readyController { _ in }
+        controller.sessionActivity = { true }
+        controller.lastTick = ProcessInfo.processInfo.systemUptime - 10
+        controller.suspend(); controller.resume(); controller.keyDown()
+        controller.tick()
+        XCTAssertEqual(controller.phase, .starting)
+        XCTAssertTrue(controller.gesture.active)
+    }
+    func testQuickTripleTapDiscardsWithoutTranscription() {
+        var requests: [String] = []
+        let controller = readyController { requests.append($0) }
+        controller.keyDown(); controller.keyUp(); controller.keyDown(); controller.keyUp(); controller.keyDown()
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertFalse(controller.handsFree)
+        XCTAssertEqual(requests, ["start", "cancel"])
+    }
+    func testWakeProbeRestartsUnresponsiveServicesAfterGrace() throws {
+        let controller = readyController { _ in }
+        defer { controller.capture.stop(); controller.worker.stop() }
+        try controller.capture.launch(URL(fileURLWithPath: "/bin/cat"))
+        try controller.worker.launch(URL(fileURLWithPath: "/bin/cat"))
+        controller.probeServicesAfterWake()
+        controller.reconcileWakeServices(now: ProcessInfo.processInfo.systemUptime + 5)
+        XCTAssertTrue(controller.capture.running)
+        XCTAssertTrue(controller.worker.running)
+        controller.keyDown()
+        controller.reconcileWakeServices(now: ProcessInfo.processInfo.systemUptime + 13)
+        XCTAssertFalse(controller.capture.running)
+        XCTAssertFalse(controller.worker.running)
+        XCTAssertFalse(controller.captureReady)
+        XCTAssertFalse(controller.modelReady)
+        XCTAssertEqual(controller.phase, .failed)
+    }
+    func testWakeProbeKeepsResponsiveServicesAndIgnoresOldPong() throws {
+        let controller = readyController { _ in }
+        defer { controller.capture.stop(); controller.worker.stop() }
+        try controller.capture.launch(URL(fileURLWithPath: "/bin/cat"))
+        try controller.worker.launch(URL(fileURLWithPath: "/bin/cat"))
+        let done = expectation(description: "current wake ping echoed")
+        controller.worker.onMessage = { request in
+            guard request["op"] as? String == "ping", let id = request["id"] as? String else { return }
+            controller.workerMessage(["event": "pong", "id": id])
+            done.fulfill()
+        }
+        controller.probeServicesAfterWake()
+        wait(for: [done], timeout: 3)
+        controller.captureMessage(["event": "permissions", "microphone": "authorized"])
+        controller.reconcileWakeServices(now: ProcessInfo.processInfo.systemUptime + 13)
+        XCTAssertTrue(controller.capture.running)
+        XCTAssertTrue(controller.worker.running)
+        controller.worker.onMessage = nil
+        controller.probeServicesAfterWake()
+        controller.workerMessage(["event": "pong", "id": "old-wake"])
+        controller.captureMessage(["event": "permissions", "microphone": "authorized"])
+        controller.reconcileWakeServices(now: ProcessInfo.processInfo.systemUptime + 13)
+        XCTAssertTrue(controller.capture.running)
+        XCTAssertFalse(controller.worker.running)
+    }
+    func testWakeProbeDoesNotInterruptModelStillLoading() throws {
+        let controller = readyController { _ in }
+        defer { controller.capture.stop(); controller.worker.stop() }
+        controller.modelReady = false
+        try controller.capture.launch(URL(fileURLWithPath: "/bin/cat"))
+        try controller.worker.launch(URL(fileURLWithPath: "/bin/cat"))
+        controller.probeServicesAfterWake()
+        controller.captureMessage(["event": "permissions", "microphone": "authorized"])
+        controller.reconcileWakeServices(now: ProcessInfo.processInfo.systemUptime + 13)
+        XCTAssertTrue(controller.worker.running)
+    }
+    func testWorkerReplacementInvalidatesOldWakeDeadline() throws {
+        let controller = readyController { _ in }
+        defer { controller.capture.stop(); controller.worker.stop() }
+        try controller.capture.launch(URL(fileURLWithPath: "/bin/cat"))
+        try controller.worker.launch(URL(fileURLWithPath: "/bin/cat"))
+        controller.probeServicesAfterWake()
+        controller.captureMessage(["event": "permissions", "microphone": "authorized"])
+        controller.worker.stop()
+        controller.componentExited(model: true)
+        try controller.worker.launch(URL(fileURLWithPath: "/bin/cat"))
+        controller.reconcileWakeServices(now: ProcessInfo.processInfo.systemUptime + 13)
+        XCTAssertTrue(controller.worker.running)
+    }
     private func insertingController() -> (Controller, String) {
         let controller = Controller(startServices: false)
         let id = UUID().uuidString
@@ -270,6 +417,9 @@ final class IntegrationTests: XCTestCase {
         XCTAssertTrue(controller.handsFree)
         controller.keyUp()
         XCTAssertEqual(controller.phase, .starting)
+        let held = expectation(description: "hands-free session outlasts the triple-tap window")
+        DispatchQueue.main.asyncAfter(deadline: .now() + PushToTalkGesture.debounce + 0.1) { held.fulfill() }
+        wait(for: [held], timeout: 3)
         controller.keyDown()
         XCTAssertEqual(controller.phase, .stopping)
         XCTAssertFalse(controller.handsFree)
@@ -379,27 +529,47 @@ final class IntegrationTests: XCTestCase {
         XCTAssertNil(controller.notice)
         XCTAssertEqual(controller.phase, .idle)
     }
-    func testListeningCueWaitsForRealAudio() {
+    func testListeningCueFollowsEngineStart() {
         let controller = readyController { _ in }
+        controller.settings.sounds = false
         controller.keyDown()
         guard let id = controller.machine.id else { return XCTFail("No session") }
         controller.captureMessage(["event": "recording", "id": id])
         XCTAssertEqual(controller.phase, .recording)
-        XCTAssertFalse(controller.micLive)
-        XCTAssertEqual(controller.message, "Starting")
-        controller.captureMessage(["event": "live", "id": id, "warmup": 0.6])
         XCTAssertTrue(controller.micLive)
         XCTAssertEqual(controller.message, "Listening")
     }
-    func testListeningCueFallsBackWhenMicNeverGoesLive() {
+    func testLateEngineStartCannotReviveStoppedRecording() {
         let controller = readyController { _ in }
+        controller.settings.sounds = false
         controller.keyDown()
         guard let id = controller.machine.id else { return XCTFail("No session") }
+        controller.stopRecording()
         controller.captureMessage(["event": "recording", "id": id])
-        let waited = expectation(description: "fallback")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.7) { waited.fulfill() }
-        wait(for: [waited], timeout: 3)
-        XCTAssertTrue(controller.micLive)
+        XCTAssertEqual(controller.phase, .stopping)
+        XCTAssertFalse(controller.micLive)
+    }
+    func testCaptureStartsBeforeShowingHUD() {
+        var requests: [String] = []
+        let controller = readyController { requests.append($0) }
+        controller.onChange = { [weak controller] in
+            if controller?.phase == .starting { XCTAssertEqual(requests, ["start"]) }
+        }
+        controller.keyDown()
+        XCTAssertEqual(controller.phase, .starting)
+    }
+    func testCaptureGraphPreparesOnlyAfterMicrophoneAuthorization() {
+        var requests: [[String: Any]] = []
+        let controller = Controller(startServices: false)
+        controller.captureRequestOverride = { requests.append($0); return true }
+        controller.settings.microphoneUID = "test-microphone"
+        controller.captureMessage(["event": "ready"])
+        controller.captureMessage(["event": "permissions", "microphone": "denied"])
+        XCTAssertFalse(requests.contains { $0["op"] as? String == "prepare" })
+        controller.captureMessage(["event": "permissions", "microphone": "authorized"])
+        let prepared = requests.filter { $0["op"] as? String == "prepare" }
+        XCTAssertEqual(prepared.count, 1)
+        XCTAssertEqual(prepared.first?["device"] as? String, "test-microphone")
     }
     func testTargetIsReadAfterCaptureStarts() {
         var order: [String] = []

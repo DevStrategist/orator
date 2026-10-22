@@ -19,6 +19,7 @@ final class Controller: NSObject, ObservableObject {
                 message = "Audio retention disabled; pending recovery recordings deleted."
             }
             configureKeys()
+            if settings.microphoneUID != oldValue.microphoneUID { prepareCapture() }
         }
     }
     private func sendCapture(_ request: [String: Any]) -> Bool {
@@ -70,6 +71,7 @@ final class Controller: NSObject, ObservableObject {
     var onChange: (() -> Void)?
     var showWindow: (() -> Void)?
     var targetProvider: () -> TargetSnapshot? = TargetSnapshot.capture
+    var sessionActivity: () -> Bool? = { NativePermissions.sessionIsActive() }
     var captureRequestOverride: (([String: Any]) -> Bool)?
     var relaunchApplication: (() -> Void)?
     let capture = ProcessBridge(), worker = ProcessBridge()
@@ -96,6 +98,9 @@ final class Controller: NSObject, ObservableObject {
     private var noticeTimer: Timer?
     private var pendingMicrophoneRequest = false
     private var lastPermissionPoll = -10.0
+    private var wakeProbeDeadline = 0.0
+    private var captureWakePending = false
+    private var workerWakeID: String?
     private var startAttempts = 0
     private var acceptedStarts = 0
     private var earlyReleases = 0
@@ -151,8 +156,15 @@ final class Controller: NSObject, ObservableObject {
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(self, selector: #selector(suspend), name: NSWorkspace.willSleepNotification, object: nil)
         center.addObserver(self, selector: #selector(suspend), name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
-        center.addObserver(self, selector: #selector(resume), name: NSWorkspace.didWakeNotification, object: nil)
+        center.addObserver(self, selector: #selector(wake), name: NSWorkspace.didWakeNotification, object: nil)
         center.addObserver(self, selector: #selector(resume), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        // A wake notification can be missed (for example when the lid opens before sleep finished), so a
+        // screen waking or unlocking also counts as being back.
+        center.addObserver(self, selector: #selector(resume), name: NSWorkspace.screensDidWakeNotification, object: nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(resume),
+                                                            name: Notification.Name("com.apple.screenIsUnlocked"), object: nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(suspend),
+                                                            name: Notification.Name("com.apple.screenIsLocked"), object: nil)
         permissionObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
             object: nil, queue: .main) { [weak self] _ in self?.permissionsChanged() })
         permissionObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
@@ -246,7 +258,8 @@ final class Controller: NSObject, ObservableObject {
         onChange?()
     }
     func startCapture() {
-        guard !shuttingDown, !sleeping else { return }
+        guard servicesEnabled, !shuttingDown, !sleeping else { return }
+        captureWakePending = false
         captureReady = false
         microphone = false
         captureMicrophoneStatus = "unknown"
@@ -256,8 +269,13 @@ final class Controller: NSObject, ObservableObject {
             try capture.launch(path)
         } catch { message = "Capture service unavailable: \((error as NSError).domain)" }
     }
+    func prepareCapture() {
+        guard captureReady, microphone, !busy, !sleeping, !shuttingDown else { return }
+        _ = sendCapture(["op": "prepare", "device": settings.microphoneUID])
+    }
     func startWorker() {
-        guard !shuttingDown, !sleeping else { return }
+        guard servicesEnabled, !shuttingDown, !sleeping else { return }
+        workerWakeID = nil
         modelReady = false
         let python = RuntimeSetup.python
         let script = Bundle.main.resourceURL!.appendingPathComponent("worker.py")
@@ -283,7 +301,8 @@ final class Controller: NSObject, ObservableObject {
         } catch { message = "Model service unavailable: \((error as NSError).domain)" }
     }
     func componentExited(model: Bool) {
-        if model { modelReady = false } else { captureReady = false }
+        if model { modelReady = false; workerWakeID = nil }
+        else { captureReady = false; captureWakePending = false }
         guard !shuttingDown, !sleeping else { return }
         if busy { fail(model ? "Local model stopped; audio retained for retry." : "Capture service stopped; partial audio retained.") }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
@@ -309,7 +328,7 @@ final class Controller: NSObject, ObservableObject {
             fail("Accessibility access was revoked. Dictation stopped safely.")
         }
         let mode = evidence.shortcutTapMode
-        if mode != .unavailable && !sleeping {
+        if mode != .unavailable {
             // A revoked grant leaves the active tap disabled; rebuild it as listen-only.
             if keys.mode == .active && mode != .active { keys.stop() }
             if now - lastTapAttempt >= 2 {
@@ -420,6 +439,8 @@ final class Controller: NSObject, ObservableObject {
             handsFree = true; onChange?()
         case .stop:
             stopRecording()
+        case .discard:
+            discardSession()
         default: break
         }
     }
@@ -434,8 +455,10 @@ final class Controller: NSObject, ObservableObject {
             }
             stopRecording()
         case .none where gesture.awaitingSecondPress:
+            let sessionID = machine.id
             DispatchQueue.main.asyncAfter(deadline: .now() + PushToTalkGesture.debounce) { [weak self] in
-                guard let self, self.gesture.expire(now: ProcessInfo.processInfo.systemUptime) == .discard else { return }
+                guard let self, self.machine.id == sessionID,
+                      self.gesture.expire(now: ProcessInfo.processInfo.systemUptime) == .discard else { return }
                 self.discardSession()
                 if self.tipDue("tap", every: 3600) {
                     self.showNotice("Hold \(self.settings.hotkey.label) while you speak, or double-tap it for hands-free.")
@@ -518,15 +541,17 @@ final class Controller: NSObject, ObservableObject {
         editWatch?.invalidate(); editWatch = nil
         expireUndo()
         message = "Opening microphone…"
+        // Opening the HUD can be slow on its first render; start the microphone in parallel.
+        let sent = sendCapture(["op": "start", "id": id, "device": sessionSettings.microphoneUID,
+                                "maxSeconds": sessionSettings.maxSeconds, "neverStore": sessionSettings.neverStore])
         publish()
-        guard sendCapture(["op": "start", "id": id, "device": sessionSettings.microphoneUID,
-                            "maxSeconds": sessionSettings.maxSeconds, "neverStore": sessionSettings.neverStore]) else {
+        guard sent else {
             fail("Cannot start capture service."); return
         }
         let snapshot = target()
         if machine.id == id { self.target = snapshot }
     }
-    /// Real audio is flowing: now it's true to say "Listening".
+    /// The microphone has started; signal quality is reported separately.
     func goLive(_ id: String) {
         guard machine.id == id, phase == .recording, !micLive else { return }
         micLive = true; message = "Listening"
@@ -553,6 +578,7 @@ final class Controller: NSObject, ObservableObject {
     func captureMessage(_ object: [String: Any]) {
         let event = object["event"] as? String
         if event == "ready" {
+            captureWakePending = false
             captureReady = true
             capture.send(["op": "permissions"])
             if pendingMicrophoneRequest {
@@ -562,8 +588,10 @@ final class Controller: NSObject, ObservableObject {
             return
         }
         if event == "permissions" {
+            captureWakePending = false
             captureMicrophoneStatus = object["microphone"] as? String ?? "unknown"
             microphone = captureMicrophoneStatus == "authorized"
+            prepareCapture()
             writeDiagnostics()
             return
         }
@@ -578,19 +606,13 @@ final class Controller: NSObject, ObservableObject {
         case "recording":
             captureStartLatency = max(0, lastEvent - captureBeganAt)
             guard machine.advance(id, to: .recording) else { return }
-            phaseStarted = lastEvent; message = "Starting"
-            // Never leave the user waiting on a cue: a muted mic gets its own hint instead.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                guard let self, self.machine.id == id, self.phase == .recording, !self.micLive else { return }
-                self.goLive(id)
-            }
+            phaseStarted = lastEvent
             inputTransport = object["transport"] as? String ?? ""
             lidBlocksMicrophone = inputTransport == "builtIn" && object["clamshell"] as? Bool == true
             publish()
+            goLive(id)
         case "live":
             micWarmup = object["warmup"] as? Double ?? 0
-            captureStartLatency = max(0, lastEvent - captureBeganAt)
-            goLive(id)
         case "level":
             level = object["level"] as? Double ?? 0
             seconds = object["seconds"] as? Double ?? 0
@@ -654,7 +676,12 @@ final class Controller: NSObject, ObservableObject {
     }
     func workerMessage(_ object: [String: Any]) {
         let event = object["event"] as? String
+        if event == "pong" {
+            if object["id"] as? String == workerWakeID { workerWakeID = nil }
+            return
+        }
         if event == "ready" {
+            workerWakeID = nil
             modelReady = true
             if phase == .idle { message = "Ready. Recognition stays on this Mac." }
             // The smaller model is running, so the old full-precision copy is no longer needed.
@@ -918,7 +945,11 @@ final class Controller: NSObject, ObservableObject {
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
     @objc func suspend() {
-        sleeping = true; keys.stop()
+        guard !sleeping else { return }
+        // The keyboard tap stays installed and only ignores keys, so the shortcut works the moment the Mac wakes.
+        sleeping = true
+        gesture.reset()
+        captureWakePending = false; workerWakeID = nil
         if busy {
             capture.stop(); worker.stop(); captureReady = false; modelReady = false
             fail("Stopped for sleep or lock. Recover captured audio explicitly.")
@@ -926,17 +957,59 @@ final class Controller: NSObject, ObservableObject {
         configureKeys()
     }
     @objc func resume() {
-        sleeping = false; keys.didWake()
-        phaseStarted = ProcessInfo.processInfo.systemUptime; lastEvent = phaseStarted
+        guard sleeping, sessionActivity() == true else { return }
+        sleeping = false; keys.didWake(); configureKeys()
+        phaseStarted = ProcessInfo.processInfo.systemUptime; lastEvent = phaseStarted; lastTick = phaseStarted
+        guard servicesEnabled else { return }
         refreshPermissions(); refreshDevices()
-        if !capture.running { startCapture() }
-        if !worker.running { startWorker() }
+        probeServicesAfterWake()
+    }
+    func probeServicesAfterWake() {
+        wakeProbeDeadline = ProcessInfo.processInfo.systemUptime + 12
+        if capture.running && !captureReady { captureStarted = ProcessInfo.processInfo.systemUptime }
+        captureWakePending = capture.running && capture.send(["op": "permissions"])
+        if !captureWakePending { startCapture() }
+        workerWakeID = nil
+        if worker.running {
+            if modelReady {
+                let id = UUID().uuidString
+                if worker.send(["op": "ping", "id": id]) { workerWakeID = id }
+                else { startWorker() }
+            } else { workerStarted = ProcessInfo.processInfo.systemUptime }
+        } else { startWorker() }
+    }
+    func reconcileWakeServices(now: TimeInterval) {
+        guard now >= wakeProbeDeadline, !sleeping, !shuttingDown else { return }
+        if captureWakePending {
+            captureWakePending = false; capture.stop(); captureReady = false
+            if [.starting, .recording, .stopping].contains(phase) {
+                fail("Microphone service did not respond after wake. Captured audio is available to recover.")
+            }
+            startCapture()
+        }
+        if workerWakeID != nil {
+            workerWakeID = nil; worker.stop(); modelReady = false
+            if busy { fail("Local model did not respond after wake. Audio retained for retry.") }
+            startWorker()
+        }
+    }
+    @objc func wake() {
+        suspend()
+        resume()
+    }
+    func reconcileSession() {
+        guard let active = sessionActivity() else { return }
+        if active { resume() } else { suspend() }
     }
     func tick() {
         defer { writeDiagnostics() }
         let now = ProcessInfo.processInfo.systemUptime
         let gap = now - lastTick; lastTick = now
-        refreshPermissions(); keys.reconcile()
+        if gap > 5 { suspend() }
+        reconcileSession()
+        guard !sleeping, servicesEnabled else { return }
+        reconcileWakeServices(now: now)
+        refreshPermissions(); configureKeys(); keys.reconcile()
         advanceCaptureDiagnostic(now)
         if now - lastRecoverySweep > 60 && !busy {
             lastRecoverySweep = now; refreshRecovery(); cleanOrphans(); refreshDevices()
@@ -948,12 +1021,6 @@ final class Controller: NSObject, ObservableObject {
         }
         if [.starting, .recording].contains(phase) && !microphone {
             fail("Microphone permission was revoked. Captured audio is available to recover.")
-            return
-        }
-        if gap > 5 {
-            phaseStarted = now; lastEvent = now
-            if busy { capture.stop(); worker.stop(); captureReady = false; modelReady = false
-                fail("System paused during dictation. Recover captured audio explicitly.") }
             return
         }
         if phase == .starting && now - phaseStarted > 3 && message == "Opening microphone…" {

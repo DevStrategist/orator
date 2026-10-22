@@ -25,11 +25,20 @@ public enum ShortcutPolicy {
                 return ShortcutEdges(starts: false, ends: false, suppressFn: false)
             }
             let down = flags & UInt64(1 << 23) != 0
-            return ShortcutEdges(starts: down, ends: !down, suppressFn: true)
+            return ShortcutEdges(starts: down && flags == required, ends: !down, suppressFn: true)
         }
         let matches = flags == required
         if binding.keyCode == -1 {
-            return ShortcutEdges(starts: kind == .flags && matches,
+            let modifier: UInt64
+            switch keyCode {
+            case 56, 60: modifier = 1 << 17
+            case 59, 62: modifier = 1 << 18
+            case 58, 61: modifier = 1 << 19
+            case 54, 55: modifier = 1 << 20
+            case 63: modifier = 1 << 23
+            default: modifier = 0
+            }
+            return ShortcutEdges(starts: kind == .flags && matches && required & modifier != 0,
                                  ends: kind == .flags && flags & required != required, suppressFn: false)
         }
         return ShortcutEdges(starts: kind == .down && keyCode == binding.keyCode && matches,

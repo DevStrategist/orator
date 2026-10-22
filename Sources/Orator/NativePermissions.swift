@@ -4,6 +4,11 @@ import Carbon
 import OratorCore
 
 enum NativePermissions {
+    static func sessionIsActive(_ session: [String: Any]? = CGSessionCopyCurrentDictionary() as? [String: Any]) -> Bool? {
+        guard let session, let onConsole = session[kCGSessionOnConsoleKey as String] as? Bool else { return nil }
+        return onConsole && session[kCGSessionLoginDoneKey as String] as? Bool == true &&
+            session["CGSSessionScreenIsLocked"] as? Bool != true
+    }
     static func accessibilityTrusted(prompt: Bool = false) -> Bool {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         return AXIsProcessTrustedWithOptions([key: prompt] as CFDictionary)

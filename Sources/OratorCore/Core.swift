@@ -52,12 +52,17 @@ public struct Hotkey: Codable, Equatable {
         self.keyCode = keyCode; self.modifiers = modifiers; self.label = label
     }
     public static let mask: UInt64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 23)
+    public static let mouseKeyOffset = 128
+    public var mouseButton: Int? {
+        ((Self.mouseKeyOffset + 2)...(Self.mouseKeyOffset + 31)).contains(keyCode) ? keyCode - Self.mouseKeyOffset : nil
+    }
     public var isFnOnly: Bool { keyCode == -1 && modifiers & Self.mask == UInt64(1 << 23) }
     public static let capsLockKey = 57
     public static let capsLock = Hotkey(keyCode: capsLockKey, modifiers: 0, label: "⇪ Caps Lock")
     /// Caps Lock only reports toggles to event taps, so it is read from HID as a single-key shortcut.
     public var isCapsLock: Bool { keyCode == Self.capsLockKey }
     public var isValid: Bool {
+        if mouseButton != nil { return true }
         if isCapsLock { return modifiers & Self.mask == 0 }
         guard (-1...127).contains(keyCode), modifiers & Self.mask != 0 else { return false }
         let flags = modifiers & Self.mask

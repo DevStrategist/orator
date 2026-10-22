@@ -70,4 +70,38 @@ final class ShortcutPolicyTests: XCTestCase {
     func testUnknownKeyboardInventoryDoesNotWarn() {
         XCTAssertTrue(FnKeyPolicy.available([]))
     }
+    func testReleasingUnrelatedModifierCannotStartDictation() {
+        let control = Hotkey(keyCode: -1, modifiers: 1 << 18, label: "Control")
+        for code in [54, 55, 56, 57, 58, 60, 61, 63] {
+            XCTAssertFalse(ShortcutPolicy.edges(binding: control, kind: .flags, keyCode: code,
+                                                modifiers: 1 << 18).starts)
+        }
+        XCTAssertTrue(ShortcutPolicy.edges(binding: control, kind: .flags, keyCode: 59,
+                                           modifiers: 1 << 18).starts)
+        XCTAssertTrue(ShortcutPolicy.edges(binding: control, kind: .flags, keyCode: 62,
+                                           modifiers: 1 << 18).starts)
+    }
+    func testFnWithOtherModifiersDoesNotStartFnOnlyShortcut() {
+        let edge = ShortcutPolicy.edges(binding: fn, kind: .flags, keyCode: 63,
+                                         modifiers: (1 << 23) | (1 << 20))
+        XCTAssertFalse(edge.starts)
+        XCTAssertFalse(edge.ends)
+    }
+    func testMouseShortcutsPersistAndMatchPressAndRelease() throws {
+        for button in [2, 3, 4, 31] {
+            var settings = Settings()
+            settings.hotkey = Hotkey(keyCode: 128 + button, modifiers: 0, label: "Mouse \(button + 1)")
+            settings.validate()
+            XCTAssertEqual(settings.hotkey.keyCode, 128 + button)
+            let decoded = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(settings))
+            XCTAssertEqual(decoded.hotkey, settings.hotkey)
+            XCTAssertTrue(ShortcutPolicy.edges(binding: settings.hotkey, kind: .down,
+                                               keyCode: 128 + button, modifiers: 0).starts)
+            XCTAssertTrue(ShortcutPolicy.edges(binding: settings.hotkey, kind: .up,
+                                               keyCode: 128 + button, modifiers: 0).ends)
+        }
+        for keyCode in [128, 129, 160, 200, Int.min, Int.max] {
+            XCTAssertFalse(Hotkey(keyCode: keyCode, modifiers: 0).isValid)
+        }
+    }
 }

@@ -447,7 +447,7 @@ private struct ShortcutPage: View {
                         if app.recordingShortcut { ShortcutRecorder.stop(app) } else { ShortcutRecorder.start(app) }
                     }.buttonStyle(PrimaryButtonStyle())
                     if app.recordingShortcut {
-                        Text("Press a modifier, a key combination or Caps Lock. Escape cancels.")
+                        Text("Press a modifier, key combination, Caps Lock or a mouse button. Escape cancels.")
                             .font(.system(size: 12)).foregroundStyle(Theme.slate)
                     } else if !app.settings.hotkey.isFnOnly {
                         Button("Use fn") { app.settings.hotkey = Hotkey(keyCode: -1, modifiers: 1 << 23, label: "Fn") }
@@ -486,12 +486,18 @@ enum ShortcutRecorder {
     static func start(_ app: Controller) {
         app.recordingShortcut = true
         var peak: UInt64 = 0
-        app.shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
+        app.shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged, .otherMouseDown]) { event in
             if event.type == .keyDown && event.keyCode == 53 { stop(app); return nil }
             if event.type == .flagsChanged && Int(event.keyCode) == Hotkey.capsLockKey {
                 app.settings.hotkey = .capsLock; Hotkeys.clearCapsLock(); stop(app); return nil
             }
             let flags = UInt64(event.modifierFlags.rawValue) & Hotkey.mask
+            if event.type == .otherMouseDown {
+                let binding = Hotkey(keyCode: Hotkey.mouseKeyOffset + event.buttonNumber, modifiers: flags,
+                                     label: label(flags) + "Mouse \(event.buttonNumber + 1)")
+                if binding.isValid { app.settings.hotkey = binding; stop(app) }
+                return nil
+            }
             if event.type == .flagsChanged {
                 peak |= flags
                 if flags == 0 && peak != 0 {
@@ -756,11 +762,10 @@ struct RecordingHUD: View {
             .animation(reduceMotion ? nil : .spring(response: 0.34, dampingFraction: 0.86), value: state)
     }
 
-    private enum State: Equatable { case listening, opening, transcribing, notice }
+    private enum State: Equatable { case listening, transcribing, notice }
     private var state: State {
         switch app.phase {
-        case .recording: return app.micLive ? .listening : .opening
-        case .starting: return .opening
+        case .starting, .recording: return .listening
         case .stopping, .transcribing: return .transcribing
         default: return .notice
         }
@@ -783,7 +788,10 @@ struct RecordingHUD: View {
         switch state {
         case .listening:
             circleButton("xmark", help: "Cancel (Esc)") { app.cancelWithUndo() }
-            Waveform(level: app.level, color: app.recordingHint == nil ? Theme.accent : Theme.warning)
+            Waveform(level: app.level, active: app.micLive,
+                     color: app.micLive ? (app.recordingHint == nil ? Theme.accent : Theme.warning) : Theme.faint)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(app.message)
             if let hint = app.recordingHint {
                 Text(hint).foregroundStyle(Theme.warning).lineLimit(1)
             }
@@ -792,10 +800,6 @@ struct RecordingHUD: View {
             if app.handsFree {
                 circleButton("stop.fill", help: "Finish", filled: true) { app.stopRecording() }
             }
-        case .opening:
-            Waveform(level: 0, active: false, color: Theme.faint).padding(.leading, 4)
-            Text(["Opening microphone…", "Starting", "Listening"].contains(app.message) ? "Starting" : app.message)
-                .foregroundStyle(Theme.slate).lineLimit(1).padding(.trailing, 4)
         case .transcribing:
             ProgressDots().padding(.leading, 6)
             Text("Transcribing").foregroundStyle(Theme.slate).padding(.trailing, 6)

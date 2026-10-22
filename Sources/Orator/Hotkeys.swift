@@ -11,6 +11,7 @@ final class Hotkeys {
     private var swallowUp = false
     private var active = false
     private var paused = false
+    private var generation = UUID()
     private var tap: CFMachPort?
     private var loop: CFRunLoop?
     private var thread: Thread?
@@ -39,19 +40,37 @@ final class Hotkeys {
 
     func configure(_ binding: Hotkey, active: Bool, paused: Bool) {
         lock.lock()
+        if self.binding != binding || self.paused != paused { resetState() }
         self.binding = binding; self.active = active; self.paused = paused
-        if paused { latch.reset() }
         lock.unlock()
     }
+    private func resetState() {
+        generation = UUID(); latch.reset(); swallowUp = false
+        previousFlags = 0; flagChangedAt = [:]
+    }
+    // Events queued before sleep, a restart or a new binding belong to the old keyboard state.
+    private func deliver(_ action: @escaping (Hotkeys) -> Void) {
+        let current = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let valid = self.generation == current && !self.paused
+            self.lock.unlock()
+            if valid { action(self) }
+        }
+    }
     func didWake() {
-        lock.lock(); wakeAt = ProcessInfo.processInfo.systemUptime; latch.reset(); lock.unlock()
+        lock.lock()
+        wakeAt = ProcessInfo.processInfo.systemUptime; disabled = []; resetState()
+        lock.unlock()
     }
     func start(_ requested: TapMode) {
         guard thread == nil, requested != .unavailable else { return }
         let worker = Thread { [weak self] in
             guard let self else { return }
             let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue) |
-                       (1 << CGEventType.flagsChanged.rawValue)
+                       (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.otherMouseDown.rawValue) |
+                       (1 << CGEventType.otherMouseUp.rawValue)
             func create(_ options: CGEventTapOptions) -> CFMachPort? {
                 CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                   options: options, eventsOfInterest: CGEventMask(mask),
@@ -106,7 +125,7 @@ final class Hotkeys {
         lock.lock()
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let loop { CFRunLoopStop(loop) }
-        latch.reset()
+        resetState()
         lock.unlock()
         available = false
     }
@@ -115,6 +134,8 @@ final class Hotkeys {
         defer { lock.unlock() }
         if let tap {
             if !CFMachPortIsValid(tap) {
+                resetState()
+                if active { deliver { $0.onCancel?() } }
                 if let loop { CFRunLoopStop(loop) }
                 return
             }
@@ -123,30 +144,32 @@ final class Hotkeys {
             }
         }
         // HID state is the physical keyboard; the session state omits keys this tap swallows.
-        guard latch.pressed, !binding.isCapsLock, ProcessInfo.processInfo.systemUptime - lastPressedAt > 2 else { return }
-        if binding.keyCode >= 0 {
+        guard latch.pressed, !binding.isCapsLock, ProcessInfo.processInfo.systemUptime - lastPressedAt > 0.25 else { return }
+        if let button = binding.mouseButton {
+            guard !CGEventSource.buttonState(.hidSystemState, button: CGMouseButton(rawValue: UInt32(button))!) else { return }
+        } else if binding.keyCode >= 0 {
             guard !CGEventSource.keyState(.hidSystemState, key: CGKeyCode(binding.keyCode)) else { return }
         } else {
             let physicalFlags = CGEventSource.flagsState(.hidSystemState).rawValue & Hotkey.mask
             guard physicalFlags & binding.modifiers != binding.modifiers else { return }
         }
         latch.reset(); recoveredReleases += 1
-        DispatchQueue.main.async { self.onUp?() }
+        deliver { $0.onUp?() }
     }
-    private func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         lock.lock(); defer { lock.unlock() }
         let now = ProcessInfo.processInfo.systemUptime
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if !active { latch.reset() }
+            if !active { resetState() }
             if type == .tapDisabledByTimeout && now - wakeAt > 30 {
                 disabled = disabled.filter { now - $0 < 60 }; disabled.append(now)
             }
             if disabled.count >= 5 {
                 disabled = []
                 if let loop { CFRunLoopStop(loop) }
-                DispatchQueue.main.async {
-                    self.report(false, "Keyboard tap repeatedly disabled; restarting")
-                    if self.active { self.onCancel?() }
+                deliver {
+                    $0.report(false, "Keyboard tap repeatedly disabled; restarting")
+                    if $0.active { $0.onCancel?() }
                 }
             } else if let tap, CFMachPortIsValid(tap) {
                 CGEvent.tapEnable(tap: tap, enable: true)
@@ -154,7 +177,10 @@ final class Hotkeys {
             return Unmanaged.passUnretained(event)
         }
         events += 1
-        let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        let mouse = type == .otherMouseDown || type == .otherMouseUp
+        let code = mouse ? Hotkey.mouseKeyOffset + Int(event.getIntegerValueField(.mouseEventButtonNumber)) :
+            Int(event.getIntegerValueField(.keyboardEventKeycode))
+        let secure = IsSecureEventInputEnabled()
         if type == .flagsChanged {
             let flags = event.flags.rawValue & Hotkey.mask
             for bit in [17, 18, 19, 20, 23].map({ UInt64(1) << $0 }) where (flags ^ previousFlags) & bit != 0 {
@@ -162,31 +188,31 @@ final class Hotkeys {
             }
             previousFlags = flags
             // Caps Lock toggles are hidden from apps while it is the dictation key.
-            if code == Hotkey.capsLockKey && binding.isCapsLock && !paused { return nil }
+            if code == Hotkey.capsLockKey && binding.isCapsLock && !paused && !secure { return nil }
         }
         if type == .flagsChanged && code == 63 {
             fnEvents += 1; lastFnAt = now
             if event.getIntegerValueField(.eventSourceUserData) == 0x4C464454 { diagnosticFnEvents += 1 }
         }
-        let secure = IsSecureEventInputEnabled()
         guard !paused, !secure, event.getIntegerValueField(.eventSourceUserData) != 0x4C464C57 else {
             // Modifier events still arrive under Secure Keyboard Entry; explain why nothing starts.
-            if secure && !paused && type != .keyUp && ShortcutPolicy.edges(binding: binding,
+            if secure && !paused && type != .keyUp && type != .otherMouseUp && ShortcutPolicy.edges(binding: binding,
                 kind: type == .flagsChanged ? .flags : .down, keyCode: code, modifiers: event.flags.rawValue).starts {
-                DispatchQueue.main.async { self.onSecureBlocked?() }
+                deliver { $0.onSecureBlocked?() }
             }
             return Unmanaged.passUnretained(event)
         }
         if code == 53 && active {
-            if type == .keyDown { DispatchQueue.main.async { self.onCancel?() } }
+            if type == .keyDown { deliver { $0.onCancel?() } }
             return nil
         }
-        if type == .keyDown && latch.pressed && code != binding.keyCode && now - lastPressedAt < 1 &&
+        if (type == .keyDown || type == .otherMouseDown) && latch.pressed && code != binding.keyCode && now - lastPressedAt < 1 &&
             event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
             // Another key joined the shortcut while starting: the user meant a system chord, not dictation.
-            DispatchQueue.main.async { self.onChord?() }
+            deliver { $0.onChord?() }
         }
-        let kind: ShortcutEventKind = type == .flagsChanged ? .flags : (type == .keyDown ? .down : .up)
+        let kind: ShortcutEventKind = type == .flagsChanged ? .flags :
+            (type == .keyDown || type == .otherMouseDown ? .down : .up)
         let edges = ShortcutPolicy.edges(binding: binding, kind: kind, keyCode: code,
                                           modifiers: event.flags.rawValue)
         let isModifier = binding.keyCode == -1
@@ -199,16 +225,16 @@ final class Hotkeys {
                           isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0), transition {
             lastPressedAt = now; swallowUp = !isModifier
             downs += 1
-            DispatchQueue.main.async { self.onDown?() }
+            deliver { $0.onDown?() }
             return edges.suppressFn || !isModifier ? nil : Unmanaged.passUnretained(event)
         }
         if edges.ends, let transition = latch.update(down: false, matches: false), !transition {
             ups += 1
-            DispatchQueue.main.async { self.onUp?() }
+            deliver { $0.onUp?() }
         }
         if edges.suppressFn && (ownedFn || latch.pressed) { return nil }
-        if code == binding.keyCode && type == .keyUp && swallowUp { swallowUp = false; return nil }
-        if code == binding.keyCode && type == .keyDown && latch.pressed { return nil }
+        if code == binding.keyCode && kind == .up && swallowUp { swallowUp = false; return nil }
+        if code == binding.keyCode && kind == .down && latch.pressed { return nil }
         return Unmanaged.passUnretained(event)
     }
     func diagnostics() -> [String: Any] {
@@ -249,14 +275,28 @@ final class Hotkeys {
     private func capsLock(down: Bool) {
         lock.lock()
         guard binding.isCapsLock, !paused else { lock.unlock(); return }
+        guard !IsSecureEventInputEnabled() else {
+            resetState()
+            if down { deliver { $0.onSecureBlocked?() } }
+            lock.unlock(); return
+        }
         let now = ProcessInfo.processInfo.systemUptime
         if let transition = latch.update(down: down, matches: true) {
-            if transition { lastPressedAt = now; downs += 1; DispatchQueue.main.async { self.onDown?() } }
-            else { ups += 1; DispatchQueue.main.async { self.onUp?() } }
+            if transition { lastPressedAt = now; downs += 1; deliver { $0.onDown?() } }
+            else { ups += 1; deliver { $0.onUp?() } }
         }
+        let current = generation
         lock.unlock()
         // macOS toggles the lock on press or release depending on timing; clear it after both.
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.05) { Self.clearCapsLock() }
+        for delay in [0.05, 0.15, 0.4, 1.0] {
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.lock.lock(); defer { self.lock.unlock() }
+                guard self.generation == current, self.binding.isCapsLock, !self.paused,
+                      !IsSecureEventInputEnabled() else { return }
+                Self.clearCapsLock()
+            }
+        }
     }
     static func clearCapsLock() {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))

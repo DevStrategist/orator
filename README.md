@@ -50,9 +50,10 @@ Then hold **fn** (or your chosen shortcut) in any app and speak.
 | Hold the shortcut | Orator listens while you hold it and types when you let go. |
 | Double-tap the shortcut | Hands-free mode. Press once more to finish. |
 | Quick tap | Ignored, so stray presses never start a dictation. |
+| Quick triple-tap | Discards the recording. |
 | Escape while speaking | Cancels. An **Undo** button appears for a few seconds. |
 
-The default shortcut is **fn**. You can pick any modifier, a key combination, or Caps Lock on the **Shortcut** page.
+The default shortcut is **fn**. You can pick any modifier, a key combination, Caps Lock, or a middle or extra mouse button on the **Shortcut** page. Double-taps and triple-taps must fall within 500 ms of the first press.
 
 ### Thoughtful details
 
@@ -62,6 +63,7 @@ The default shortcut is **fn**. You can pick any modifier, a key combination, or
 - **Never types in the wrong place.** If focus moves before your words arrive, the transcript stays in Orator for you to copy.
 - **Explains problems plainly.** It tells you when the mic is muted, the lid is closed, another app holds the microphone, or Secure Keyboard Entry is blocking shortcuts.
 - **Recovers audio.** If something fails, the recording is kept for 24 hours so you can transcribe it again.
+- **Recovers after sleep.** Shortcuts resume after unlocking, with a system-state check every second in case a wake notification is missed.
 - **Optional quiet mode.** Pause Spotify or Music, or mute other audio, while you dictate.
 
 ## Privacy

@@ -32,6 +32,36 @@ final class SnapshotTests: XCTestCase {
         app.devices = [("built-in", "MacBook Neo Microphone"), ("usb", "Shure MV7")]
         return app
     }
+    func testStartupHUDUsesTheSamePillSizeAsListening() {
+        _ = NSApplication.shared
+        let starting = readyController()
+        starting.phase = .starting; starting.message = "Opening microphone…"; starting.seconds = 0
+        let listening = readyController()
+        listening.phase = .recording; listening.micLive = true; listening.seconds = 0
+        let startupSize = NSHostingView(rootView: RecordingHUD(app: starting)).fittingSize
+        let listeningSize = NSHostingView(rootView: RecordingHUD(app: listening)).fittingSize
+        XCTAssertEqual(startupSize.width, listeningSize.width, accuracy: 0.5)
+        XCTAssertEqual(startupSize.height, listeningSize.height, accuracy: 0.5)
+    }
+    func testReopeningHUDDoesNotReusePreviousNoticeRendering() throws {
+        _ = NSApplication.shared
+        let app = readyController()
+        let delegate = AppDelegate()
+        delegate.controller = app
+        app.onChange = { [weak delegate] in delegate?.update() }
+        app.showNotice("Pasted. This app doesn't report its text, so give it a quick check.")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        let previousHost = try XCTUnwrap(delegate.hudHost)
+        app.dismissNotice()
+        XCTAssertNil(delegate.hudHost, "Hidden HUD content must release the previous notice's animation state")
+        app.phase = .starting; app.message = "Opening microphone…"
+        delegate.update()
+        defer { delegate.hud?.orderOut(nil) }
+        let host = try XCTUnwrap(delegate.hudHost)
+        XCTAssertFalse(host === previousHost)
+        let expected = NSHostingView(rootView: RecordingHUD(app: app)).fittingSize
+        XCTAssertEqual(host.fittingSize, expected)
+    }
     func testRenderSnapshots() throws {
         guard let path = ProcessInfo.processInfo.environment["ORATOR_SNAPSHOT_DIR"] else { throw XCTSkip("Set ORATOR_SNAPSHOT_DIR") }
         let folder = URL(fileURLWithPath: path)
@@ -44,7 +74,9 @@ final class SnapshotTests: XCTestCase {
         try render(SettingsView(app: fresh), size: NSSize(width: 900, height: 640), name: "page-Setup", to: folder)
 
         let hud = readyController()
-        hud.phase = .recording; hud.level = 0.05; hud.seconds = 7
+        hud.phase = .starting; hud.message = "Opening microphone…"; hud.seconds = 0
+        try render(RecordingHUD(app: hud).padding(30).background(Color(white: 0.85)), size: NSSize(width: 360, height: 110), name: "hud-starting", to: folder)
+        hud.phase = .recording; hud.micLive = true; hud.level = 0.05; hud.seconds = 7
         try render(RecordingHUD(app: hud).padding(30).background(Color(white: 0.85)), size: NSSize(width: 360, height: 110), name: "hud-listening", to: folder)
         hud.handsFree = true
         try render(RecordingHUD(app: hud).padding(30).background(Color(white: 0.85)), size: NSSize(width: 360, height: 110), name: "hud-handsfree", to: folder)
