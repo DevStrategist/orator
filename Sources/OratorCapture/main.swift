@@ -246,7 +246,9 @@ final class Recorder {
         observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
                                                            object: audio, queue: nil) { [weak self] _ in
             self?.graph.async {
-                guard let self, self.engine === audio, self.token?.id == current.id, !current.stopped,
+                guard let self else { return }
+                self.tokenLock.lock(); let ownsToken = self.token === current; self.tokenLock.unlock()
+                guard ownsToken, self.engine === audio, !current.stopped,
                       !current.shouldStop else { return }
                 let actualFormat = audio.inputNode.outputFormat(forBus: 0)
                 let currentHardware = currentDevice(audio.inputNode.audioUnit)
@@ -280,7 +282,8 @@ final class Recorder {
     }
 
     func recover(_ current: CaptureToken) {
-        guard !current.shouldStop, !current.stopped, token?.id == current.id else { return }
+        tokenLock.lock(); let ownsToken = token === current; tokenLock.unlock()
+        guard ownsToken, !current.shouldStop, !current.stopped else { return }
         guard configurationRestarts < CapturePolicy.maxConfigurationRestarts else {
             failure = "Microphone stopped delivering audio; captured audio is available to recover"
             stop(current.id); return
