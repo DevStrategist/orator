@@ -19,7 +19,6 @@ final class Controller: NSObject, ObservableObject {
                 message = "Audio retention disabled; pending recovery recordings deleted."
             }
             configureKeys()
-            if settings.microphoneUID != oldValue.microphoneUID { prepareCapture() }
         }
     }
     private func sendCapture(_ request: [String: Any]) -> Bool {
@@ -268,10 +267,6 @@ final class Controller: NSObject, ObservableObject {
             captureStarted = ProcessInfo.processInfo.systemUptime
             try capture.launch(path)
         } catch { message = "Capture service unavailable: \((error as NSError).domain)" }
-    }
-    func prepareCapture() {
-        guard captureReady, microphone, !busy, !sleeping, !shuttingDown else { return }
-        _ = sendCapture(["op": "prepare", "device": settings.microphoneUID])
     }
     func startWorker() {
         guard servicesEnabled, !shuttingDown, !sleeping else { return }
@@ -591,7 +586,6 @@ final class Controller: NSObject, ObservableObject {
             captureWakePending = false
             captureMicrophoneStatus = object["microphone"] as? String ?? "unknown"
             microphone = captureMicrophoneStatus == "authorized"
-            prepareCapture()
             writeDiagnostics()
             return
         }

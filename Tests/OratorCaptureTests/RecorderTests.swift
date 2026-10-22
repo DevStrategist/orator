@@ -4,6 +4,22 @@ import OratorCore
 @testable import OratorCapture
 
 final class RecorderTests: XCTestCase {
+    func testStoppingCaptureReleasesEngineWithoutPreparingIdleHardware() {
+        final class InertEngine: AVAudioEngine {
+            var preparations = 0
+            override func prepare() { preparations += 1 }
+            override func stop() {}
+        }
+        let recorder = Recorder(), token = CaptureToken(UUID().uuidString), engine = InertEngine()
+        recorder.token = token; recorder.engine = engine; recorder.keepRecovery = false
+        recorder.deviceInfo = ["transport": "builtIn"]
+        recorder.stop(token.id)
+        recorder.graph.sync {}
+        recorder.writer.sync {}
+        XCTAssertNil(recorder.engine)
+        XCTAssertEqual(engine.preparations, 0)
+    }
+
     func testRetiredGraphCannotAppendToTheSameRecording() throws {
         try withRecording { recorder, token in
             let target = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,

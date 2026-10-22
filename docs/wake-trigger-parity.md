@@ -15,7 +15,7 @@
 | Signal readiness after real microphone audio arrives | Immediate rounded opening popup; Listening and its sound follow usable PCM rather than engine startup |
 | Recover same-device format changes | Rebuild the engine, tap and converter with bounded retries; drain old PCM and reject retired graph callbacks |
 | Detect a stalled or silent microphone | Repair missing callbacks after five seconds; allow one silent-start reopen after six seconds of exact zeros, without rejecting quiet valid audio |
-| Release Bluetooth input between dictations | Discard the stopped Bluetooth engine so a later press negotiates a fresh capture format |
+| Release audio hardware between dictations | Create an engine only for an explicit recording; fully release it after stop. Idle permission checks and input selection never prepare audio hardware |
 
 Orator keeps its tap installed but paused while locked. Queued shortcut callbacks
 are invalidated on pause, wake, stop and binding changes. A missed sleep signal

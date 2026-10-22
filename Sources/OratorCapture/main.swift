@@ -86,15 +86,6 @@ final class Recorder {
             }
             return
         }
-        if op == "prepare" {
-            graph.async {
-                self.tokenLock.lock(); let idle = self.token == nil; self.tokenLock.unlock()
-                guard idle, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
-                do { _ = try self.prepareEngine(request["device"] as? String ?? "") }
-                catch { self.engine = nil }
-            }
-            return
-        }
         if op == "shutdown" {
             tokenLock.lock(); let current = token; tokenLock.unlock()
             if let current {
@@ -130,9 +121,7 @@ final class Recorder {
         emit(["event": "permissions", "microphone": status])
     }
 
-    func prepareEngine(_ uid: String) throws -> AVAudioEngine {
-        if let engine, engineDeviceUID == uid, let device = deviceID(uid),
-           currentDevice(engine.inputNode.audioUnit) == device, transport(device) != "bluetooth" { return engine }
+    func makeEngine(_ uid: String) throws -> AVAudioEngine {
         let audio = AVAudioEngine()
         if !uid.isEmpty {
             guard let selectedDevice = deviceID(uid), let unit = audio.inputNode.audioUnit else {
@@ -148,8 +137,6 @@ final class Recorder {
         guard input.sampleRate > 0, input.channelCount > 0 else {
             throw NSError(domain: "Microphone format is unavailable", code: 4)
         }
-        // Allocate the graph ahead of key-down without starting microphone capture.
-        audio.prepare()
         engine = audio; engineDeviceUID = uid
         return audio
     }
@@ -196,7 +183,7 @@ final class Recorder {
             failure = "Microphone permission is required"
             return
         }
-        let audio = try prepareEngine(uid)
+        let audio = try makeEngine(uid)
         let input = audio.inputNode.outputFormat(forBus: 0)
         guard input.sampleRate > 0, input.channelCount > 0,
               let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
@@ -458,19 +445,8 @@ final class Recorder {
             guard !current.stopped else { return }
             current.stopped = true
             self.timer?.cancel(); self.timer = nil
-            if let observer = self.observer { NotificationCenter.default.removeObserver(observer) }
-            self.observer = nil
-            if let engine = self.engine {
-                if self.tapInstalled { engine.inputNode.removeTap(onBus: 0) }
-                self.tapInstalled = false
-                engine.stop()
-                if self.failure == nil && self.deviceInfo["transport"] as? String != "bluetooth" {
-                    engine.prepare()
-                } else { self.engine = nil }
-            }
+            self.releaseEngine(current)
             self.writer.async {
-                self.flushConverter(current)
-                self.captureGeneration = nil
                 do { try self.file?.synchronize(); try self.file?.close() }
                 catch { self.failure = "Recording finalization failed; partial audio retained" }
                 self.file = nil

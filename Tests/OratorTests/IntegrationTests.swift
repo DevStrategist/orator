@@ -580,7 +580,7 @@ final class IntegrationTests: XCTestCase {
         controller.keyDown()
         XCTAssertEqual(controller.phase, .starting)
     }
-    func testCaptureGraphPreparesOnlyAfterMicrophoneAuthorization() {
+    func testIdlePermissionPollingAndInputSelectionDoNotPrepareAudioHardware() {
         var requests: [[String: Any]] = []
         let controller = Controller(startServices: false)
         controller.captureRequestOverride = { requests.append($0); return true }
@@ -589,9 +589,11 @@ final class IntegrationTests: XCTestCase {
         controller.captureMessage(["event": "permissions", "microphone": "denied"])
         XCTAssertFalse(requests.contains { $0["op"] as? String == "prepare" })
         controller.captureMessage(["event": "permissions", "microphone": "authorized"])
-        let prepared = requests.filter { $0["op"] as? String == "prepare" }
-        XCTAssertEqual(prepared.count, 1)
-        XCTAssertEqual(prepared.first?["device"] as? String, "test-microphone")
+        controller.captureMessage(["event": "permissions", "microphone": "authorized"])
+        controller.captureMessage(["event": "permissions", "microphone": "authorized"])
+        controller.settings.microphoneUID = "another-microphone"
+        XCTAssertTrue(controller.microphone)
+        XCTAssertFalse(requests.contains { $0["op"] as? String == "prepare" })
     }
     func testTargetIsReadAfterCaptureStarts() {
         var order: [String] = []
